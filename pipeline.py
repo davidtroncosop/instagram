@@ -1276,6 +1276,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Publicar el mismo MP4 en Instagram y TikTok después de generar",
     )
+    parser.add_argument(
+        "--upload-cloudinary",
+        action="store_true",
+        help="Subir el MP4 final a Cloudinary sin publicarlo en redes sociales",
+    )
     parser.add_argument("--public-url", help="URL HTTPS pública del MP4 para Instagram/TikTok")
     parser.add_argument("--caption", help="Caption del Reel")
     parser.add_argument(
@@ -1382,10 +1387,16 @@ def main() -> int:
             final_video_path = subtitled_video_path
             print(f"Video con subtítulos guardado en: {final_video_path}")
 
+        uploaded_public_url = ""
+        if args.upload_cloudinary:
+            print(f"Subiendo {final_video_path.name} a Cloudinary sin publicar...")
+            uploaded_public_url = upload_video_to_cloudinary(final_video_path)
+            print(f"MP4 disponible en: {uploaded_public_url}")
+
         publish_instagram = args.publish or args.publish_both
         publish_tiktok_requested = args.publish_tiktok or args.publish_both
         if publish_instagram or publish_tiktok_requested:
-            public_url = (args.public_url or "").strip()
+            public_url = uploaded_public_url or (args.public_url or "").strip()
             if publish_instagram and not public_url:
                 public_url = os.getenv("INSTAGRAM_VIDEO_URL", "").strip()
             if publish_tiktok_requested and not public_url:

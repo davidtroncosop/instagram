@@ -38,6 +38,7 @@ class RunRequest(BaseModel):
     organic_test: bool = True
     model_image_url: str | None = None
     base_video_url: str | None = None
+    upload_output: bool = False
     offer: dict[str, Any] | None = None
     knasta_enabled: bool | None = None
     knasta_search_terms: list[str] | None = None
@@ -168,6 +169,8 @@ def execute_pipeline(run_id: str, request: RunRequest) -> None:
             command.append("--organic-test")
         if request.publish:
             command.append("--publish")
+        if request.upload_output:
+            command.append("--upload-cloudinary")
 
         update_state(run_id, status="running", updated_at=time.time())
         env = os.environ.copy()
