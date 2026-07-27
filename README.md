@@ -230,6 +230,32 @@ ManyChat se configura aparte, no dentro de Python:
 
 Incluye la divulgación de afiliado en el caption y/o mensaje, y activa la etiqueta de colaboración pagada cuando corresponda.
 
+## Ejecución autónoma: Cloudflare + Cloud Run + Cloudinary
+
+La infraestructura quedó preparada así:
+
+- Cloudflare Worker: `https://instagram-offers-scheduler.davidtroncosop.workers.dev`.
+  Tiene un cron cada 30 minutos y filtra 08:30, 14:00 y 20:30 en
+  `America/Santiago`, para no depender del horario UTC durante el cambio de hora.
+- Cloud Run: ejecuta el contenedor Python con MoviePy, FFmpeg, Vertex AI,
+  Fish Audio, Groq, Cloudinary e Instagram.
+- Secret Manager: guarda las claves privadas; no se copian al Worker ni a git.
+- Cloudinary: entrega la URL HTTPS pública que Instagram necesita para leer el MP4.
+
+La automatización y la publicación están desactivadas mientras se verifica una
+ejecución manual: `ENABLE_AUTOMATION=false` y `PUBLISH_ENABLED=false`. Para
+activarlas, cambia esos dos valores en `deploy/cloudflare-worker/wrangler.toml`
+y ejecuta:
+
+```bash
+wrangler deploy --config=deploy/cloudflare-worker/wrangler.toml --keep-vars
+```
+
+La URL de Falabella configurada es solo una oferta de prueba. La integración
+actual recibe la ficha oficial de Falabella encontrada desde Knasta y descarga
+las cuatro fotos desde el retailer; el rastreador automático de Knasta todavía
+es una etapa posterior.
+
 ## Fuentes
 
 - [OpenAI: edición y referencias con GPT Image 2](https://developers.openai.com/api/docs/guides/image-generation#edit-images)

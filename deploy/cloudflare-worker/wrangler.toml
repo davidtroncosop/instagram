@@ -1,0 +1,20 @@
+name = "instagram-offers-scheduler"
+main = "src/index.js"
+compatibility_date = "2026-07-26"
+
+# The account already uses three cron triggers in other Workers and has a
+# five-trigger limit. This single trigger wakes every 30 minutes; the Worker
+# filters the exact Chile peak slots in America/Santiago, including DST.
+[triggers]
+crons = ["*/30 * * * *"]
+
+[vars]
+ENABLE_AUTOMATION = "false"
+PUBLISH_ENABLED = "false"
+ORGANIC_TEST = "true"
+PIPELINE_URL = "https://instagram-pipeline-ibqkuagyua-tl.a.run.app"
+PRODUCT_URL = "https://www.falabella.com/falabella-cl/product/883321561/Poleron-Deportivo-Algodon-Mujer-Diadora/883321581"
+NARRATION_TEXT = "Mira lo que encontré... Polerón deportivo de algodón para mujer Diadora, de $24.990 bajó a $19.990... Quedan pocas tallas... Comenta LOOK y te mando el link..."
+MODEL_IMAGE_URL = "https://res.cloudinary.com/kjn27uc8/image/upload/v1785092024/instagram-reels/assets/model-reference-1785092022.jpg"
+BASE_VIDEO_URL = "https://res.cloudinary.com/kjn27uc8/video/upload/v1785092026/instagram-reels/assets/base-video-1785092024.mp4"
+INSTAGRAM_CAPTION = "Mira el outfit completo y verifica precio y stock en Falabella... #CreadoConIA #Publicidad"
