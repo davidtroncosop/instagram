@@ -28,6 +28,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import httpx
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from openai import OpenAI
 
 
@@ -465,43 +466,60 @@ def generate_outfit_image(
     output_path: Path,
     prompt: str,
 ) -> None:
-    """Create the virtual try-on image with GPT Image 2."""
+    """Create the virtual try-on image with Gemini image generation."""
 
-    client = OpenAI(api_key=required_env("OPENAI_API_KEY"))
     if not garment_images:
         raise PipelineError("Debes entregar al menos una imagen de la prenda")
+    if mask:
+        raise PipelineError(
+            "La ruta de imagen con Gemini no usa --mask; entrega la foto de la modelo "
+            "y las vistas de la prenda sin máscara."
+        )
 
-    model_file = model_image.open("rb")
-    garment_files = [path.open("rb") for path in garment_images]
-    mask_file = mask.open("rb") if mask else None
+    backend = gemini_backend()
+    client = create_gemini_client(backend)
+    image_model = (
+        os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
+        or "gemini-2.5-flash-image"
+    )
+    contents: list[Any] = []
+    for path in [model_image, *garment_images]:
+        contents.append(
+            types.Part.from_bytes(
+                data=path.read_bytes(),
+                mime_type=image_mime_type(path),
+            )
+        )
+    contents.append(prompt)
 
     try:
-        request: dict[str, Any] = {
-            "model": "gpt-image-2",
-            # If a mask is supplied, OpenAI applies it to the first image.
-            "image": [model_file, *garment_files],
-            "prompt": prompt,
-            "size": "1024x1536",
-            "quality": os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip() or "medium",
-        }
-        if mask_file:
-            request["mask"] = mask_file
+        response = client.models.generate_content(
+            model=image_model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=[types.Modality.TEXT, types.Modality.IMAGE],
+            ),
+        )
+    except Exception as exc:
+        raise PipelineError(
+            f"Gemini no pudo generar la imagen de outfit con {image_model}: {exc}"
+        ) from exc
 
-        try:
-            result = client.images.edit(**request)
-        except Exception as exc:
-            raise PipelineError(f"OpenAI no pudo generar la imagen de outfit: {exc}") from exc
-    finally:
-        model_file.close()
-        for garment_file in garment_files:
-            garment_file.close()
-        if mask_file:
-            mask_file.close()
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            inline_data = getattr(part, "inline_data", None)
+            image_data = getattr(inline_data, "data", None)
+            if not image_data:
+                continue
+            if isinstance(image_data, str):
+                image_data = base64.b64decode(image_data)
+            output_path.write_bytes(bytes(image_data))
+            return
 
-    if not result.data or not result.data[0].b64_json:
-        raise PipelineError("OpenAI no devolvió una imagen de outfit")
-
-    output_path.write_bytes(base64.b64decode(result.data[0].b64_json))
+    response_text = str(getattr(response, "text", "") or "").strip()
+    detail = f" Texto devuelto: {response_text[:300]}" if response_text else ""
+    raise PipelineError(f"Gemini no devolvió una imagen de outfit.{detail}")
 
 
 def resource_state(resource: Any) -> str:

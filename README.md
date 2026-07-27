@@ -2,7 +2,7 @@
 
 Pipeline en Python para:
 
-1. fusionar una foto de modelo con hasta nueve vistas de una prenda usando `gpt-image-2`;
+1. fusionar una foto de modelo con hasta nueve vistas de una prenda usando Gemini en Vertex AI;
 2. convertir esa imagen en video con `gemini-omni-flash-preview`;
 3. editar un video base conservando su movimiento (`--base-video`);
 4. publicar opcionalmente el mismo MP4 en Instagram y TikTok.
@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 Completa `.env` según el backend que quieras usar:
 
-- `OPENAI_API_KEY`: clave de OpenAI.
+- `OPENAI_API_KEY`: opcional; solo se usa si ejecutas `--generate-script` explícitamente.
 - `GEMINI_BACKEND=vertex`: usa Gemini Omni Flash desde Google Cloud Agent Platform.
 - `GOOGLE_CLOUD_PROJECT`: ID del proyecto de GCP con facturación y Agent Platform API.
 - `GOOGLE_CLOUD_LOCATION=global`: ubicación de Gemini Omni Flash.
