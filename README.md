@@ -2,8 +2,8 @@
 
 Pipeline en Python para:
 
-1. fusionar una foto de modelo con hasta nueve vistas de una prenda usando Gemini en Vertex AI;
-2. convertir esa imagen en video con `gemini-omni-flash-preview`;
+1. entregar a Gemini Omni Flash la foto de modelo, hasta nueve vistas de la prenda y un video base;
+2. generar directamente el Reel final con `gemini-omni-flash-preview`;
 3. editar un video base conservando su movimiento (`--base-video`);
 4. publicar opcionalmente el mismo MP4 en Instagram y TikTok.
 
@@ -54,7 +54,6 @@ no activa el crédito de GCP.
 
 - `modelo.jpg`: persona/modelo con derechos para usar la imagen.
 - `prendas/`: una o más imágenes de la misma prenda. Para cuatro vistas, usa cuatro archivos PNG/JPG/WEBP.
-- `mask.png`: opcional. Debe tener el mismo tamaño/formato que `modelo.jpg`, incluir canal alpha y marcar la zona que se editará. Si se usa con dos imágenes, la máscara se aplica a la primera (`modelo.jpg`).
 - `movimiento.mp4`: opcional. Si se entrega, Gemini intenta conservar su pose, cámara y movimiento.
 
 ## Uso
@@ -76,7 +75,6 @@ python pipeline.py \
   --garment-image prenda-espalda.png \
   --garment-image prenda-lateral-a.png \
   --garment-image prenda-lateral-b.png \
-  --mask mask.png \
   --base-video movimiento.mp4
 ```
 
@@ -143,7 +141,7 @@ El script usa automáticamente:
 
 El prompt predeterminado reemplaza a la chica del video por la chica de la
 foto, conserva el ambiente de la foto y viste la prenda usando todas sus
-vistas. Puedes sustituirlo con `--outfit-prompt` y `--video-prompt`.
+vistas. Puedes sustituirlo con `--video-prompt`.
 
 ## Voz y subtítulos opcionales
 

@@ -1,4 +1,4 @@
-"""Generate an affiliate-fashion Reel with GPT Image 2 and Gemini Omni Flash.
+"""Generate an affiliate-fashion Reel with Gemini Omni Flash.
 
 The script deliberately stops at a local MP4 unless a publication flag is
 passed. Instagram and TikTok require the final MP4 to be available at a public
@@ -28,36 +28,23 @@ from urllib.parse import unquote, urljoin, urlparse
 import httpx
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
 from openai import OpenAI
 
 
 load_dotenv()
 
-DEFAULT_OUTFIT_PROMPT = """
-Image 1 is the identity and environment reference. Keep the same adult woman,
-face, hair, skin tone, body proportions, room, lighting, and camera feeling.
-Images 2 onward are different views of the same shirt. Replace the black top
-with that exact shirt, using all garment references to reconstruct its front,
-back, collar, sleeves, fabric, seams, fit, color, print, labels, and logos.
-Preserve the woman's identity and the room from image 1. Remove the cosmetic
-bottle and unrelated product branding unless it is part of the shirt reference.
-Do not invent text, patterns, accessories, or brand details. Produce a
-photorealistic portrait image suitable as a 9:16 video reference.
-""".strip()
-
 DEFAULT_VIDEO_PROMPT = """
-Recreate the source video as one continuous realistic vertical 9:16 shot.
-The four garment references downloaded from the retailer product link are the
-only authority for the clothing. The outfit reference image is the authority
-for the adult woman's identity and for the complete room and background.
-Replace the original performer, clothing, and entire original environment with
-the woman, exact retailer garment, room, walls, decor, and lighting from the
-references. Do not preserve any background element from the source video.
-Preserve only the source video's timing, movement, gestures, camera motion,
-and framing, naturally restaged inside the reference room. Do not show the
-original performer. Do not add text, watermarks, invented accessories, or
-unsupported product claims. Keep the result suitable for an Instagram Reel.
+Create one continuous realistic vertical 9:16 Reel.
+The source video, when provided, is authority only for timing, movement,
+gestures, camera motion, and framing. The still photo of the adult woman is
+authority for her identity, room, background, lighting, and camera feeling.
+The following four still images are the only authority for the exact retailer
+garment: front, back, collar, sleeves, fabric, seams, fit, color, print,
+labels, and logos. Replace the original performer, clothing, and entire
+original environment with the woman wearing that exact garment in her room.
+Do not preserve the source video's background or original performer. Do not
+invent text, patterns, accessories, or product claims. Keep the result
+photorealistic and suitable for an Instagram Reel.
 """.strip()
 
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -459,69 +446,6 @@ def upload_to_gcs(path: Path, bucket: str) -> str:
     return uri
 
 
-def generate_outfit_image(
-    model_image: Path,
-    garment_images: list[Path],
-    mask: Path | None,
-    output_path: Path,
-    prompt: str,
-) -> None:
-    """Create the virtual try-on image with Gemini image generation."""
-
-    if not garment_images:
-        raise PipelineError("Debes entregar al menos una imagen de la prenda")
-    if mask:
-        raise PipelineError(
-            "La ruta de imagen con Gemini no usa --mask; entrega la foto de la modelo "
-            "y las vistas de la prenda sin máscara."
-        )
-
-    backend = gemini_backend()
-    client = create_gemini_client(backend)
-    image_model = (
-        os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
-        or "gemini-2.5-flash-image"
-    )
-    contents: list[Any] = []
-    for path in [model_image, *garment_images]:
-        contents.append(
-            types.Part.from_bytes(
-                data=path.read_bytes(),
-                mime_type=image_mime_type(path),
-            )
-        )
-    contents.append(prompt)
-
-    try:
-        response = client.models.generate_content(
-            model=image_model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=[types.Modality.TEXT, types.Modality.IMAGE],
-            ),
-        )
-    except Exception as exc:
-        raise PipelineError(
-            f"Gemini no pudo generar la imagen de outfit con {image_model}: {exc}"
-        ) from exc
-
-    for candidate in getattr(response, "candidates", []) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", []) or []:
-            inline_data = getattr(part, "inline_data", None)
-            image_data = getattr(inline_data, "data", None)
-            if not image_data:
-                continue
-            if isinstance(image_data, str):
-                image_data = base64.b64decode(image_data)
-            output_path.write_bytes(bytes(image_data))
-            return
-
-    response_text = str(getattr(response, "text", "") or "").strip()
-    detail = f" Texto devuelto: {response_text[:300]}" if response_text else ""
-    raise PipelineError(f"Gemini no devolvió una imagen de outfit.{detail}")
-
-
 def resource_state(resource: Any) -> str:
     state = getattr(resource, "state", None)
     name = getattr(state, "name", state)
@@ -626,9 +550,16 @@ def save_gemini_video(client: Any, interaction: Any, output_path: Path) -> None:
     output_path.write_bytes(bytes(video_bytes))
 
 
-def generate_video(outfit_image: Path, base_video: Path | None, output_path: Path, prompt: str) -> None:
-    """Animate the outfit image, optionally preserving motion from a source video."""
+def generate_video(
+    reference_images: list[Path],
+    base_video: Path | None,
+    output_path: Path,
+    prompt: str,
+) -> None:
+    """Generate video directly from the movement video and all still references."""
 
+    if not reference_images:
+        raise PipelineError("Debes entregar la foto de la modelo y las vistas de la prenda")
     backend = gemini_backend()
     client = create_gemini_client(backend)
     aspect_ratio = os.getenv("GEMINI_ASPECT_RATIO", "9:16").strip() or "9:16"
@@ -667,22 +598,23 @@ def generate_video(outfit_image: Path, base_video: Path | None, output_path: Pat
                 }
             )
 
-    if bucket:
-        inputs.append(
-            {
-                "type": "image",
-                "uri": upload_to_gcs(outfit_image, bucket),
-                "mime_type": image_mime_type(outfit_image),
-            }
-        )
-    else:
-        inputs.append(
-            {
-                "type": "image",
-                "data": encode_base64(outfit_image),
-                "mime_type": image_mime_type(outfit_image),
-            }
-        )
+    for reference_image in reference_images:
+        if bucket:
+            inputs.append(
+                {
+                    "type": "image",
+                    "uri": upload_to_gcs(reference_image, bucket),
+                    "mime_type": image_mime_type(reference_image),
+                }
+            )
+        else:
+            inputs.append(
+                {
+                    "type": "image",
+                    "data": encode_base64(reference_image),
+                    "mime_type": image_mime_type(reference_image),
+                }
+            )
     inputs.append({"type": "text", "text": prompt})
 
     request: dict[str, Any] = {
@@ -1283,10 +1215,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Imagen existente que Gemini usará como reemplazo en el video",
     )
-    parser.add_argument("--mask", type=Path, help="Máscara PNG opcional para la zona de ropa")
     parser.add_argument("--base-video", type=Path, help="Video de movimiento para video-to-video")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--outfit-prompt", default=DEFAULT_OUTFIT_PROMPT)
     parser.add_argument(
         "--video-prompt",
         default=os.getenv("GEMINI_VIDEO_PROMPT", "").strip() or DEFAULT_VIDEO_PROMPT,
@@ -1335,7 +1265,7 @@ def main() -> int:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
         if args.reference_image:
-            video_reference = validate_input(args.reference_image, "imagen de referencia")
+            reference_images = [validate_input(args.reference_image, "imagen de referencia")]
         else:
             model_path = args.model_image or default_download_asset(
                 "MODEL_IMAGE_PATH", DEFAULT_MODEL_IMAGE
@@ -1350,8 +1280,8 @@ def main() -> int:
                 if garment_dir is None and not args.garment_image:
                     garment_dir = default_download_asset("GARMENT_DIR", DEFAULT_GARMENT_DIR)
                 garment_images = collect_garment_images(args.garment_image, garment_dir)
+            reference_images = [model_image, *garment_images]
 
-        mask = validate_input(args.mask, "máscara") if args.mask else None
         if args.base_video:
             base_video = validate_input(args.base_video, "video base")
         else:
@@ -1362,23 +1292,11 @@ def main() -> int:
             base_video = normalize_base_video(base_video, args.out_dir, stamp)
         video_path = args.out_dir / f"reel-{stamp}.mp4"
 
-        if args.reference_image:
-            print(f"1/2 Usando imagen de referencia existente: {video_reference}")
-        else:
-            outfit_path = args.out_dir / f"outfit-{stamp}.png"
-            print(
-                f"1/3 Generando outfit con GPT Image 2 usando {len(garment_images)} vista(s) de la prenda..."
-            )
-            generate_outfit_image(model_image, garment_images, mask, outfit_path, args.outfit_prompt)
-            print(f"Imagen guardada en: {outfit_path}")
-            video_reference = outfit_path
-
         print(
-            "2/2 Generando video con Gemini Omni Flash..."
-            if args.reference_image
-            else "2/3 Generando video con Gemini Omni Flash..."
+            "Generando video con Gemini Omni Flash usando "
+            f"{len(reference_images)} referencia(s) visual(es)..."
         )
-        generate_video(video_reference, base_video, video_path, args.video_prompt)
+        generate_video(reference_images, base_video, video_path, args.video_prompt)
         final_video_path = video_path
         print(f"Video guardado en: {final_video_path}")
 
