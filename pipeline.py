@@ -486,19 +486,58 @@ def wait_for_gemini_interaction(client: Any, interaction: Any) -> Any:
         if status == "completed":
             return current
         if status in {"failed", "cancelled", "incomplete", "budget_exceeded"}:
-            detail = (
-                getattr(current, "error", None)
-                or getattr(current, "failure_reason", None)
-                or getattr(current, "reason", None)
-            )
-            if isinstance(detail, dict):
-                detail = detail.get("message") or detail.get("detail") or detail
+            detail = interaction_error_detail(current)
             suffix = f" Detalle: {detail}" if detail else ""
             raise PipelineError(f"Gemini terminó la interacción con estado: {status}.{suffix}")
         time.sleep(poll_seconds)
         current = client.interactions.get(id=interaction_id)
 
     raise PipelineError("Tiempo agotado esperando la interacción de Gemini")
+
+
+def interaction_error_detail(interaction: Any) -> str:
+    """Extract a compact provider error without dumping media payloads."""
+
+    def find_error(value: Any, depth: int = 0) -> Any:
+        if depth > 4 or value is None:
+            return None
+        if isinstance(value, dict):
+            for key in ("error", "failure_reason", "reason", "message", "detail"):
+                if value.get(key):
+                    return value[key]
+            for nested in value.values():
+                found = find_error(nested, depth + 1)
+                if found:
+                    return found
+            return None
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                found = find_error(nested, depth + 1)
+                if found:
+                    return found
+            return None
+        return None
+
+    detail = find_error(interaction)
+    if detail is None:
+        for method_name in ("model_dump", "to_dict"):
+            method = getattr(interaction, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                detail = find_error(
+                    method(exclude_none=True) if method_name == "model_dump" else method()
+                )
+            except Exception:
+                continue
+            if detail is not None:
+                break
+
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("detail") or detail.get("reason") or detail
+    if detail is None:
+        return ""
+    return str(detail).strip()
 
 
 def file_name_from_uri(uri: str) -> str:
@@ -620,16 +659,16 @@ def generate_video(
     request: dict[str, Any] = {
         "model": "gemini-omni-flash-preview",
         "input": inputs,
-        "generation_config": {
-            "video_config": {
-                "task": (
-                    "edit"
-                    if base_video
-                    else ("reference_to_video" if backend == "vertex" else "image_to_video")
-                )
-            }
-        },
     }
+    # With a source video, Omni infers the edit operation from the video,
+    # references, and prompt. Google's own-video edit example omits task;
+    # keep the explicit task only for reference-to-video generation.
+    if not base_video:
+        request["generation_config"] = {
+            "video_config": {
+                "task": "reference_to_video" if backend == "vertex" else "image_to_video"
+            }
+        }
     # Omni's uploaded-video edit schema derives the output geometry and
     # duration from the source video. The API rejects aspect_ratio (and other
     # generation controls) inside response_format for that task.
@@ -977,7 +1016,7 @@ def render_subtitles(video_path: Path, words: list[dict[str, Any]], output_path:
 
 
 def normalize_base_video(video_path: Path, out_dir: Path, stamp: str) -> Path:
-    """Trim source footage to Gemini Omni Flash's 10-second input limit."""
+    """Trim source footage and remove audio before sending it to Gemini."""
 
     try:
         from moviepy import VideoFileClip
@@ -987,26 +1026,29 @@ def normalize_base_video(video_path: Path, out_dir: Path, stamp: str) -> Path:
     clip = VideoFileClip(str(video_path))
     try:
         duration = float(clip.duration or 0)
-        if duration <= 10.0:
+        has_audio = clip.audio is not None
+        if duration <= 10.0 and not has_audio:
             return video_path
 
-        trimmed_path = out_dir / f"source-trimmed-{stamp}.mp4"
-        trimmed = clip.subclipped(0, 10.0)
+        normalized_path = out_dir / f"source-gemini-{stamp}.mp4"
+        trimmed = clip.subclipped(0, min(duration, 10.0))
         try:
             trimmed.write_videofile(
-                str(trimmed_path),
+                str(normalized_path),
                 codec="libx264",
-                audio=clip.audio is not None,
-                audio_codec="aac" if clip.audio is not None else None,
+                audio=False,
                 fps=clip.fps or 30,
                 logger=None,
             )
         finally:
             trimmed.close()
-        print(
-            f"Video base de {duration:.2f}s recortado a 10.00s para cumplir el límite de Gemini: {trimmed_path}"
-        )
-        return trimmed_path
+        changes: list[str] = []
+        if duration > 10.0:
+            changes.append("recortado a 10.00s")
+        if has_audio:
+            changes.append("sin audio")
+        print(f"Video base normalizado para Gemini ({', '.join(changes)}): {normalized_path}")
+        return normalized_path
     finally:
         clip.close()
 
