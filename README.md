@@ -171,7 +171,8 @@ eso el guion comercial se limita a 28 palabras y sigue un formato breve como:
 `Mira lo que encontré... polerón oversais, de 35 mil bajó a 12 mil dos cincuenta. Quedan pocas tallas. Comenta LOOK y te mando el link...`
 
 Si ya tienes una imagen de la persona que quieres usar como reemplazo, puedes
-saltarte GPT Image 2 y usarla directamente como referencia de Gemini:
+entregarla directamente a Gemini junto con el video base; no se crea una imagen
+intermedia:
 
 ```bash
 python pipeline.py \
@@ -209,6 +210,8 @@ python pipeline.py \
 `--publish-both` usa el mismo MP4 y caption en ambas plataformas. El script crea
 el contenedor de Reel, espera `FINISHED` y llama a `media_publish`; para TikTok
 inicia el Direct Post y consulta su estado hasta `PUBLISH_COMPLETE`.
+
+Para revisar el MP4 en Cloudinary sin publicar nada, usa `--upload-cloudinary`.
 
 La publicación directa en TikTok requiere una app registrada, el producto
 Content Posting API, autorización del scope `video.publish` y autorización de
@@ -273,7 +276,6 @@ para entornos donde Knasta permita la consulta desde esa red.
 
 ## Fuentes
 
-- [OpenAI: edición y referencias con GPT Image 2](https://developers.openai.com/api/docs/guides/image-generation#edit-images)
 - [Google Cloud: Gemini Omni Flash en Agent Platform](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-flash-preview?hl=es)
 - [Google Cloud: generación de video con Gemini Omni Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/generate-videos-from-text)
 - [Fish Audio: Text to Speech](https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech)
