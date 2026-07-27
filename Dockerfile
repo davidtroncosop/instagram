@@ -24,6 +24,7 @@ RUN pip install --upgrade pip \
     && pip install -r /app/requirements.txt
 
 COPY pipeline.py /app/pipeline.py
+COPY knasta_scraper.py /app/knasta_scraper.py
 COPY deploy/cloud-run/service_app.py /app/service_app.py
 
 EXPOSE 8080

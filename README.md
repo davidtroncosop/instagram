@@ -251,10 +251,27 @@ y ejecuta:
 wrangler deploy --config=deploy/cloudflare-worker/wrangler.toml --keep-vars
 ```
 
-La URL de Falabella configurada es solo una oferta de prueba. La integración
-actual recibe la ficha oficial de Falabella encontrada desde Knasta y descarga
-las cuatro fotos desde el retailer; el rastreador automático de Knasta todavía
-es una etapa posterior.
+El scraper de Knasta ya está integrado. Lee el JSON público que acompaña a las
+páginas `/results`, filtra Falabella, exige una rebaja real mínima de 30% y
+entrega una ficha oficial del retailer para que el pipeline descargue las
+cuatro fotos desde Falabella. No consulta `/api`, no sigue `/redirect` y respeta
+`robots.txt` y una pausa entre búsquedas.
+
+Puedes probarlo localmente sin generar video:
+
+```bash
+python knasta_scraper.py \
+  --terms "poleron levis" \
+  --min-discount 30 \
+  --limit 3 \
+  --narration
+```
+
+El endpoint protegido `GET /offers` del Worker permite comprobar las ofertas
+en producción sin iniciar Gemini, Fish Audio, Groq ni Instagram. El Worker usa
+ese mismo criterio cuando `KNASTA_ENABLED=true`, selecciona la mejor oferta y
+envía su ficha JSON a Cloud Run. Cloud Run conserva además un endpoint `/offers`
+para entornos donde Knasta permita la consulta desde esa red.
 
 ## Fuentes
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import subprocess
 import sys
@@ -13,8 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from knasta_scraper import KnastaScraperError, build_narration, scrape_knasta_offers
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -35,6 +38,10 @@ class RunRequest(BaseModel):
     organic_test: bool = True
     model_image_url: str | None = None
     base_video_url: str | None = None
+    offer: dict[str, Any] | None = None
+    knasta_enabled: bool | None = None
+    knasta_search_terms: list[str] | None = None
+    min_discount_percent: float | None = None
 
 
 def require_trigger_token(authorization: str | None) -> None:
@@ -53,6 +60,57 @@ def required_value(request_value: str | None, env_name: str) -> str:
     if not value:
         raise ValueError(f"Missing {env_name}")
     return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "true" if default else "false").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
+def resolve_offer_inputs(request: RunRequest, workdir: Path) -> tuple[str, str, str]:
+    """Resolve either a static test offer or the best live Knasta offer."""
+
+    use_knasta = (
+        request.knasta_enabled
+        if request.knasta_enabled is not None
+        else env_bool("KNASTA_ENABLED", False)
+    )
+    offer = request.offer
+    if offer is None and use_knasta:
+        offers = scrape_knasta_offers(
+            search_terms=request.knasta_search_terms,
+            minimum_discount_percent=request.min_discount_percent,
+            limit=1,
+        )
+        if not offers:
+            raise ValueError("Knasta no encontró una oferta de Falabella con el descuento mínimo")
+        offer = offers[0]
+    if offer is not None:
+        if not isinstance(offer, dict):
+            raise ValueError("La oferta recibida no tiene formato JSON válido")
+        if not str(offer.get("product_url") or "").startswith("https://www.falabella.com/falabella-cl/"):
+            raise ValueError("La oferta recibida no contiene una URL oficial de Falabella")
+        (workdir / "offer.json").write_text(
+            json.dumps(offer, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        product_url = str(offer["product_url"])
+        narration = (request.narration_text or build_narration(offer)).strip()
+        caption = (
+            request.caption
+            or os.getenv("INSTAGRAM_CAPTION", "").strip()
+            or f"{offer['product_name']} en Falabella... #CreadoConIA #Publicidad"
+        ).strip()
+        return product_url, narration, caption
+
+    product_url = required_value(request.product_url, "PRODUCT_URL")
+    narration = required_value(request.narration_text, "NARRATION_TEXT")
+    caption = (request.caption or os.getenv("INSTAGRAM_CAPTION", "")).strip()
+    return product_url, narration, caption
 
 
 def download_asset(url: str, destination: Path) -> None:
@@ -78,13 +136,11 @@ def execute_pipeline(run_id: str, request: RunRequest) -> None:
     base_video_path = workdir / "base-video.mp4"
 
     try:
-        product_url = required_value(request.product_url, "PRODUCT_URL")
+        product_url, narration, caption = resolve_offer_inputs(request, workdir)
         if not product_url.startswith("https://www.falabella.com/"):
             raise ValueError("product_url must be an official Falabella HTTPS URL")
-        narration = required_value(request.narration_text, "NARRATION_TEXT")
         model_url = required_value(request.model_image_url, "MODEL_IMAGE_URL")
         base_video_url = required_value(request.base_video_url, "BASE_VIDEO_URL")
-        caption = (request.caption or os.getenv("INSTAGRAM_CAPTION", "")).strip()
 
         update_state(run_id, status="downloading_assets", updated_at=time.time())
         download_asset(model_url, model_path)
@@ -148,8 +204,31 @@ def health() -> dict[str, Any]:
         "pipeline_present": (APP_ROOT / "pipeline.py").is_file(),
         "cloudinary_configured": bool(os.getenv("CLOUDINARY_URL", "").strip()),
         "gcp_project_configured": bool(os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()),
+        "knasta_scraper_present": True,
         "active_run": ACTIVE_RUN,
     }
+
+
+@app.get("/offers")
+def offers(
+    authorization: str | None = Header(default=None),
+    terms: str | None = Query(default=None, description="Términos separados por coma"),
+    min_discount: float | None = Query(default=None, ge=0, le=100),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, Any]:
+    """Read live offers without starting the expensive media pipeline."""
+
+    require_trigger_token(authorization)
+    try:
+        return {
+            "offers": scrape_knasta_offers(
+                search_terms=terms,
+                minimum_discount_percent=min_discount,
+                limit=limit,
+            )
+        }
+    except KnastaScraperError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/run", status_code=202)
