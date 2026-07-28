@@ -2,9 +2,9 @@
 
 Pipeline en Python para:
 
-1. entregar a Gemini Omni Flash la foto de modelo, hasta nueve vistas de la prenda y un video base;
-2. generar directamente el Reel final con `gemini-omni-flash-preview`;
-3. editar un video base conservando su movimiento (`--base-video`);
+1. entregar a Nano Banana 2 la foto de modelo y hasta nueve vistas de la prenda;
+2. crear una imagen maestra 9:16 con `gemini-3.1-flash-image`;
+3. animarla con `gemini-omni-flash-preview` y el movimiento de un video base;
 4. publicar opcionalmente el mismo MP4 en Instagram y TikTok.
 
 ## Instalación
@@ -23,6 +23,15 @@ Completa `.env` según el backend que quieras usar:
 - `GOOGLE_CLOUD_LOCATION=global`: ubicación de Gemini Omni Flash.
 - `GEMINI_GCS_BUCKET`: bucket `gs://` opcional para subir los medios de entrada de Vertex; se recomienda para videos locales grandes.
 - `GEMINI_API_KEY`: solo se usa si `GEMINI_BACKEND=ai_studio`.
+- `NANO_BANANA_MODEL=gemini-3.1-flash-image`: modelo de Nano Banana 2 que
+  crea la imagen maestra intermedia.
+- `NANO_BANANA_IMAGE_SIZE=2K` y `NANO_BANANA_ASPECT_RATIO=9:16`: calidad y
+  formato de esa imagen.
+- `GEMINI_VIDEO_MODE=reference_to_video`: Gemini 3 Flash describe solamente la
+  coreografía del clip y Omni anima la imagen maestra sin heredar el fondo del
+  video original. `video_edit` conserva el modo de edición directa como opción.
+- `GEMINI_MOTION_MODEL=gemini-3-flash-preview`: modelo que convierte el clip
+  base en una instrucción breve de movimiento.
 - `INSTAGRAM_ACCESS_TOKEN`: token con permiso de publicación.
 - `INSTAGRAM_USER_ID`: ID de la cuenta profesional de Instagram.
 - `META_API_VERSION`: versión habilitada en tu aplicación de Meta.
@@ -139,9 +148,13 @@ El script usa automáticamente:
 - `Descargas/ChatGPT_Image_22_jul_2026,_202607252032.jpeg` como modelo y fondo.
 - `Descargas/0718_202607252032.mp4` como video base.
 
-El prompt predeterminado reemplaza a la chica del video por la chica de la
-foto, conserva el ambiente de la foto y viste la prenda usando todas sus
-vistas. Puedes sustituirlo con `--video-prompt`.
+El primer prompt viste a la chica de la foto con la prenda, preservando su
+identidad y el ambiente, y guarda `nano-banana-master-*.jpg`. Omni utiliza
+después esa imagen como autoridad visual. Para evitar que el fondo del clip se
+filtre al resultado, Gemini 3 Flash convierte primero el video base en una
+descripción de su coreografía y Omni recibe esa descripción, no los píxeles del
+clip. Puedes sustituir los prompts con `--master-prompt`, `--video-prompt` y
+`GEMINI_MOTION_PROMPT`.
 
 ## Voz y subtítulos opcionales
 
@@ -170,19 +183,20 @@ El video generado por Gemini Omni Flash tiene un límite de 10 segundos. Por
 eso el guion comercial se limita a 28 palabras y sigue un formato breve como:
 `Mira lo que encontré... polerón oversais, de 35 mil bajó a 12 mil dos cincuenta. Quedan pocas tallas. Comenta LOOK y te mando el link...`
 
-Si ya tienes una imagen de la persona que quieres usar como reemplazo, puedes
-entregarla directamente a Gemini junto con el video base; no se crea una imagen
-intermedia:
+Si ya tienes una imagen maestra de la persona vestida con la prenda y en el
+fondo final, puedes entregarla directamente a Omni y omitir Nano Banana 2:
 
 ```bash
 python pipeline.py \
-  --reference-image persona.jpg \
+  --reference-image imagen-maestra.jpg \
+  --garment-dir prendas \
   --base-video movimiento.mp4 \
   --video-prompt "Recreate video replace girl"
 ```
 
-En este modo, `--reference-image` es la nueva persona y `--base-video` es el
-video cuyo movimiento se quiere conservar.
+En este modo, `--reference-image` ya debe contener la apariencia final y
+`--base-video` es el video cuyo movimiento se quiere conservar. Las referencias
+de prenda son opcionales, pero ayudan a Omni a mantener sus detalles.
 
 Los archivos quedan en `outputs/`.
 
@@ -276,8 +290,10 @@ para entornos donde Knasta permita la consulta desde esa red.
 
 ## Fuentes
 
+- [Google Cloud: generación de imágenes con Gemini 3.1 Flash Image](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/image-generation)
+- [Google Cloud: Gemini 3 Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-flash)
 - [Google Cloud: Gemini Omni Flash en Agent Platform](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-flash-preview?hl=es)
-- [Google Cloud: generación de video con Gemini Omni Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/generate-videos-from-text)
+- [Google Cloud: video con imágenes de referencia y Gemini Omni Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/use-reference-images-to-guide-video-generation)
 - [Fish Audio: Text to Speech](https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech)
 - [Groq: Speech to Text](https://console.groq.com/docs/speech-to-text)
 - [MoviePy: documentación](https://zulko.github.io/moviepy/)

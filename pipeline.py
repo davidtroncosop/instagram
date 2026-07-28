@@ -28,23 +28,66 @@ from urllib.parse import unquote, urljoin, urlparse
 import httpx
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from openai import OpenAI
 
 
 load_dotenv()
 
+DEFAULT_MASTER_IMAGE_PROMPT = """
+Use case: identity-preserve fashion compositing.
+Asset type: master reference frame for a realistic vertical fashion Reel.
+
+Input roles:
+- Image 1 is the authoritative photo of the adult woman and her room.
+- Images 2 through the final image are authoritative retailer references of
+  one exact garment, shown from different angles.
+
+Replace only the clothing worn by the woman in Image 1 with the exact garment
+shown in the retailer references. Preserve the woman's identity, face, body
+shape, pose, hair, expression, skin tone, and proportions. Preserve the room,
+background, furniture, camera angle, perspective, framing, lighting, shadows,
+and color treatment from Image 1.
+
+Reproduce the garment faithfully: exact garment category, fit, length, color,
+fabric, collar, sleeves, seams, cuffs, prints, labels, and visible logos. Make
+the garment fit naturally on her body with physically plausible folds,
+occlusion, highlights, and shadows. Do not combine it with the original
+clothing. Remove any cosmetic, bottle, package, or unrelated product held in
+her hands and reconstruct the uncovered hand in a relaxed natural gesture. Do
+not invent accessories, text, patterns, logos, product features, or a different
+room. Do not add captions, borders, collages, or watermarks.
+
+Output one continuous photorealistic full-frame image in vertical 9:16,
+suitable as the master visual reference for an Instagram Reel.
+""".strip()
+
 DEFAULT_VIDEO_PROMPT = """
 Create one continuous realistic vertical 9:16 Reel.
-The source video, when provided, is authority only for timing, movement,
-gestures, camera motion, and framing. The still photo of the adult woman is
-authority for her identity, room, background, lighting, and camera feeling.
-The following four still images are the only authority for the exact retailer
-garment: front, back, collar, sleeves, fabric, seams, fit, color, print,
-labels, and logos. Replace the original performer, clothing, and entire
-original environment with the woman wearing that exact garment in her room.
-Do not preserve the source video's background or original performer. Do not
-invent text, patterns, accessories, or product claims. Keep the result
-photorealistic and suitable for an Instagram Reel.
+The first still image is a prepared master reference and is the only authority
+for the adult woman's identity, room, background, lighting, framing, and
+overall appearance while wearing the garment. The following still images are
+retailer references and are the only authority for the garment's exact front,
+back, collar, sleeves, fabric, seams, fit, color, print, labels, and logos. If
+a source video or textual choreography is provided, use it only for timing,
+movement, gestures, and camera motion.
+
+Recreate the source video's movement using the woman and complete scene from
+the master reference. Keep her face, body shape, hair, room, and garment
+consistent in every frame. Do not preserve the source video's original
+performer, clothing, or background. Do not invent text, patterns, accessories,
+logos, product features, or product claims. Do not add captions or watermarks.
+Keep the result photorealistic and suitable for an Instagram Reel.
+""".strip()
+
+DEFAULT_MOTION_ANALYSIS_PROMPT = """
+Analyze only the visible choreography in this short vertical presenter video.
+Return one concise English direction for a video generator describing the
+chronological body movement, hand gestures, head movement, shot progression,
+camera movement, and approximate timing. Do not mention or describe the
+person's identity, face, hair, body, clothing, room, background, colors, text,
+logos, objects, or audio. Do not add commentary; return only the movement
+direction.
 """.strip()
 
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -589,16 +632,150 @@ def save_gemini_video(client: Any, interaction: Any, output_path: Path) -> None:
     output_path.write_bytes(bytes(video_bytes))
 
 
+def generate_master_reference_image(
+    model_image: Path,
+    garment_images: list[Path],
+    output_path: Path,
+    prompt: str,
+) -> None:
+    """Dress the model with the exact garment using Nano Banana 2."""
+
+    if not garment_images:
+        raise PipelineError("Nano Banana 2 necesita al menos una foto de la prenda")
+
+    backend = gemini_backend()
+    client = create_gemini_client(backend)
+    model = (
+        os.getenv("NANO_BANANA_MODEL", "gemini-3.1-flash-image").strip()
+        or "gemini-3.1-flash-image"
+    )
+    aspect_ratio = os.getenv("NANO_BANANA_ASPECT_RATIO", "9:16").strip() or "9:16"
+    if aspect_ratio not in {
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+    }:
+        raise PipelineError("NANO_BANANA_ASPECT_RATIO no es válido")
+    image_size = os.getenv("NANO_BANANA_IMAGE_SIZE", "2K").strip().upper() or "2K"
+    if image_size not in {"512", "1K", "2K", "4K"}:
+        raise PipelineError("NANO_BANANA_IMAGE_SIZE debe ser 512, 1K, 2K o 4K")
+
+    contents: list[Any] = [prompt]
+    for reference_image in [model_image, *garment_images]:
+        contents.append(
+            types.Part.from_bytes(
+                data=reference_image.read_bytes(),
+                mime_type=image_mime_type(reference_image),
+            )
+        )
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=[types.Modality.IMAGE],
+                image_config=types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    output_mime_type="image/jpeg",
+                ),
+            ),
+        )
+    except Exception as exc:
+        provider = "Google Cloud" if backend == "vertex" else "Gemini API"
+        raise PipelineError(
+            f"{provider} no pudo crear la imagen maestra con Nano Banana 2: {exc}"
+        ) from exc
+
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            inline_data = getattr(part, "inline_data", None)
+            image_data = getattr(inline_data, "data", None)
+            if image_data:
+                output_path.write_bytes(bytes(image_data))
+                return
+
+    feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(feedback, "block_reason", None)
+    suffix = f" Motivo: {block_reason}" if block_reason else ""
+    raise PipelineError(f"Nano Banana 2 no devolvió una imagen.{suffix}")
+
+
+def describe_video_motion(video_path: Path) -> str:
+    """Convert a movement clip into choreography without carrying over its scene."""
+
+    backend = gemini_backend()
+    client = create_gemini_client(backend)
+    model = (
+        os.getenv("GEMINI_MOTION_MODEL", "gemini-3-flash-preview").strip()
+        or "gemini-3-flash-preview"
+    )
+    prompt = (
+        os.getenv("GEMINI_MOTION_PROMPT", "").strip()
+        or DEFAULT_MOTION_ANALYSIS_PROMPT
+    )
+    contents: list[Any] = [
+        prompt,
+        types.Part.from_bytes(
+            data=video_path.read_bytes(),
+            mime_type="video/mp4",
+        ),
+    ]
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=[types.Modality.TEXT],
+                temperature=0.1,
+            ),
+        )
+    except Exception as exc:
+        provider = "Google Cloud" if backend == "vertex" else "Gemini API"
+        raise PipelineError(
+            f"{provider} no pudo analizar el movimiento del video base: {exc}"
+        ) from exc
+
+    try:
+        description = str(getattr(response, "text", "") or "").strip()
+    except (ValueError, AttributeError):
+        description = ""
+    if not description:
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                text = getattr(part, "text", None)
+                if text:
+                    description = str(text).strip()
+                    break
+            if description:
+                break
+    if not description:
+        raise PipelineError("Gemini no devolvió una descripción del movimiento")
+    return description
+
+
 def generate_video(
     reference_images: list[Path],
     base_video: Path | None,
     output_path: Path,
     prompt: str,
 ) -> None:
-    """Generate video directly from the movement video and all still references."""
+    """Animate a prepared master image using the movement video and garment references."""
 
     if not reference_images:
-        raise PipelineError("Debes entregar la foto de la modelo y las vistas de la prenda")
+        raise PipelineError("Debes entregar una imagen maestra como referencia visual")
     backend = gemini_backend()
     client = create_gemini_client(backend)
     aspect_ratio = os.getenv("GEMINI_ASPECT_RATIO", "9:16").strip() or "9:16"
@@ -1255,13 +1432,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reference-image",
         type=Path,
-        help="Imagen existente que Gemini usará como reemplazo en el video",
+        help="Imagen maestra ya preparada; omite Nano Banana 2 y admite referencias de prenda",
     )
     parser.add_argument("--base-video", type=Path, help="Video de movimiento para video-to-video")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
     parser.add_argument(
+        "--master-prompt",
+        default=os.getenv("NANO_BANANA_PROMPT", "").strip() or DEFAULT_MASTER_IMAGE_PROMPT,
+        help="Prompt para vestir a la modelo con Nano Banana 2",
+    )
+    parser.add_argument(
         "--video-prompt",
         default=os.getenv("GEMINI_VIDEO_PROMPT", "").strip() or DEFAULT_VIDEO_PROMPT,
+    )
+    parser.add_argument(
+        "--video-mode",
+        choices=("reference_to_video", "video_edit"),
+        default=os.getenv("GEMINI_VIDEO_MODE", "reference_to_video").strip()
+        or "reference_to_video",
+        help="reference_to_video preserva la escena maestra; video_edit modifica el clip original",
     )
     parser.add_argument("--offer-json", type=Path, help="Oferta JSON para generar un guion comercial")
     parser.add_argument("--generate-script", action="store_true", help="Generar guion con OpenAI desde --offer-json")
@@ -1299,11 +1488,9 @@ def main() -> int:
         if args.generate_script and not args.offer_json:
             raise PipelineError("--generate-script necesita --offer-json")
 
-        if args.reference_image and (
-            args.model_image or args.garment_image or args.garment_dir or args.product_url
-        ):
+        if args.reference_image and args.model_image:
             raise PipelineError(
-                "Usa --reference-image solo, o usa --model-image junto con las imágenes de la prenda; no mezcles los dos modos."
+                "Usa --reference-image o --model-image, no ambos."
             )
         if args.product_url and (args.garment_image or args.garment_dir):
             raise PipelineError("Usa --product-url o las imágenes locales de la prenda, no ambos.")
@@ -1312,7 +1499,19 @@ def main() -> int:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
         if args.reference_image:
-            reference_images = [validate_input(args.reference_image, "imagen de referencia")]
+            master_image = validate_input(args.reference_image, "imagen de referencia")
+            garment_images: list[Path] = []
+            if args.product_url:
+                scraped_garment_dir = args.out_dir / f"scraped-garments-{stamp}"
+                print(f"Descargando fotos de la prenda desde Falabella: {args.product_url}")
+                garment_images = download_product_images(args.product_url, scraped_garment_dir)
+            elif args.garment_image or args.garment_dir:
+                garment_images = collect_garment_images(
+                    args.garment_image,
+                    args.garment_dir,
+                )
+            reference_images = [master_image, *garment_images]
+            print("Usando la imagen maestra existente; se omite Nano Banana 2.")
         else:
             model_path = args.model_image or default_download_asset(
                 "MODEL_IMAGE_PATH", DEFAULT_MODEL_IMAGE
@@ -1327,7 +1526,20 @@ def main() -> int:
                 if garment_dir is None and not args.garment_image:
                     garment_dir = default_download_asset("GARMENT_DIR", DEFAULT_GARMENT_DIR)
                 garment_images = collect_garment_images(args.garment_image, garment_dir)
-            reference_images = [model_image, *garment_images]
+
+            master_image = args.out_dir / f"nano-banana-master-{stamp}.jpg"
+            print(
+                "Generando imagen maestra 9:16 con Nano Banana 2 usando "
+                f"la modelo y {len(garment_images)} vista(s) de la prenda..."
+            )
+            generate_master_reference_image(
+                model_image,
+                garment_images,
+                master_image,
+                args.master_prompt,
+            )
+            print(f"Imagen maestra guardada en: {master_image}")
+            reference_images = [master_image, *garment_images]
 
         if args.base_video:
             base_video = validate_input(args.base_video, "video base")
@@ -1335,15 +1547,32 @@ def main() -> int:
             default_video = default_download_asset("BASE_VIDEO_PATH", DEFAULT_BASE_VIDEO)
             base_video = validate_input(default_video, "video base") if default_video.is_file() else None
 
-        if base_video:
+        video_prompt = args.video_prompt
+        generation_video = base_video
+        if base_video and args.video_mode == "reference_to_video":
+            print(
+                "Analizando la coreografía del video base con Gemini, "
+                "sin transferir su persona ni su fondo..."
+            )
+            motion_description = describe_video_motion(base_video)
+            print(f"Coreografía detectada: {motion_description}")
+            video_prompt = (
+                f"{video_prompt}\n\n"
+                "Motion choreography to recreate while preserving the master "
+                f"scene exactly:\n{motion_description}"
+            )
+            generation_video = None
+        elif base_video:
             base_video = normalize_base_video(base_video, args.out_dir, stamp)
+            generation_video = base_video
         video_path = args.out_dir / f"reel-{stamp}.mp4"
 
         print(
-            "Generando video con Gemini Omni Flash usando "
-            f"{len(reference_images)} referencia(s) visual(es)..."
+            "Animando la imagen maestra con Gemini Omni Flash usando "
+            f"{len(reference_images)} referencia(s) visual(es) en modo "
+            f"{args.video_mode}..."
         )
-        generate_video(reference_images, base_video, video_path, args.video_prompt)
+        generate_video(reference_images, generation_video, video_path, video_prompt)
         final_video_path = video_path
         print(f"Video guardado en: {final_video_path}")
 
