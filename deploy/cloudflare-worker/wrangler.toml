@@ -9,8 +9,8 @@ compatibility_date = "2026-07-26"
 crons = ["*/30 * * * *"]
 
 [vars]
-ENABLE_AUTOMATION = "false"
-PUBLISH_ENABLED = "false"
+ENABLE_AUTOMATION = "true"
+PUBLISH_ENABLED = "true"
 ORGANIC_TEST = "true"
 KNASTA_ENABLED = "true"
 KNASTA_SEARCH_TERMS = "poleron,polera,jeans,chaqueta,vestido"
