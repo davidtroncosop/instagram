@@ -12,6 +12,7 @@ import base64
 import hashlib
 from html import unescape
 from html.parser import HTMLParser
+from io import BytesIO
 import json
 import mimetypes
 import os
@@ -30,6 +31,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import OpenAI
+from PIL import Image, UnidentifiedImageError
 
 
 load_dotenv()
@@ -310,6 +312,31 @@ def product_image_candidates(page_html: str, page_url: str) -> list[str]:
     return candidates
 
 
+def save_normalized_product_image(raw_image: bytes, output_path: Path) -> bool:
+    """Validate retailer bytes and save a real RGB JPEG for Gemini."""
+
+    try:
+        with Image.open(BytesIO(raw_image)) as source:
+            source.load()
+            if source.width < 256 or source.height < 256:
+                return False
+            if source.mode in {"RGBA", "LA"} or "transparency" in source.info:
+                rgba = source.convert("RGBA")
+                normalized = Image.new("RGB", rgba.size, "white")
+                normalized.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                normalized = source.convert("RGB")
+            normalized.save(
+                output_path,
+                format="JPEG",
+                quality=95,
+                optimize=True,
+            )
+    except (OSError, UnidentifiedImageError, ValueError):
+        return False
+    return True
+
+
 def download_product_images(product_url: str, output_dir: Path, count: int = 4) -> list[Path]:
     """Download garment photos from a public Falabella product page.
 
@@ -360,14 +387,11 @@ def download_product_images(product_url: str, output_dir: Path, count: int = 4) 
                     image_response.raise_for_status()
                 except httpx.HTTPError:
                     continue
-                content_type = image_response.headers.get("content-type", "").split(";", 1)[0].lower()
-                extension = mimetypes.guess_extension(content_type or "") or Path(urlparse(image_url).path).suffix.lower()
-                if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
-                    extension = ".jpg"
                 if not image_response.content or len(image_response.content) > 20 * 1024 * 1024:
                     continue
-                image_path = output_dir / f"{len(downloaded) + 1:02d}-prenda{extension}"
-                image_path.write_bytes(image_response.content)
+                image_path = output_dir / f"{len(downloaded) + 1:02d}-prenda.jpg"
+                if not save_normalized_product_image(image_response.content, image_path):
+                    continue
                 downloaded.append(image_path)
                 downloaded_urls.append(image_url)
 
