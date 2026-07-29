@@ -1,4 +1,4 @@
-"""Generate an affiliate-fashion Reel with Gemini Omni Flash.
+"""Generate an affiliate-fashion Reel with GPT Image 2 and Gemini Omni Flash.
 
 The script deliberately stops at a local MP4 unless a publication flag is
 passed. Instagram and TikTok require the final MP4 to be available at a public
@@ -12,7 +12,6 @@ import base64
 import hashlib
 from html import unescape
 from html.parser import HTMLParser
-from io import BytesIO
 import json
 import mimetypes
 import os
@@ -26,70 +25,31 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urljoin, urlparse
 
+import io
+from PIL import Image
 import httpx
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+import google.auth
 from openai import OpenAI
-from PIL import Image, UnidentifiedImageError
 
 
 load_dotenv()
 
-DEFAULT_MASTER_IMAGE_PROMPT = """
-Use case: identity-preserve fashion compositing.
-Asset type: master reference frame for a realistic vertical fashion Reel.
-
-Input roles:
-- Image 1 is the authoritative photo of the adult woman and her room.
-- Images 2 through the final image are authoritative retailer references of
-  one exact garment, shown from different angles.
-
-Replace only the clothing worn by the woman in Image 1 with the exact garment
-shown in the retailer references. Preserve the woman's identity, face, body
-shape, pose, hair, expression, skin tone, and proportions. Preserve the room,
-background, furniture, camera angle, perspective, framing, lighting, shadows,
-and color treatment from Image 1.
-
-Reproduce the garment faithfully: exact garment category, fit, length, color,
-fabric, collar, sleeves, seams, cuffs, prints, labels, and visible logos. Make
-the garment fit naturally on her body with physically plausible folds,
-occlusion, highlights, and shadows. Do not combine it with the original
-clothing. Remove any cosmetic, bottle, package, or unrelated product held in
-her hands and reconstruct the uncovered hand in a relaxed natural gesture. Do
-not invent accessories, text, patterns, logos, product features, or a different
-room. Do not add captions, borders, collages, or watermarks.
-
-Output one continuous photorealistic full-frame image in vertical 9:16,
-suitable as the master visual reference for an Instagram Reel.
+DEFAULT_OUTFIT_PROMPT = """
+La Imagen 1 es la chica de referencia (rostro, cabello, cuerpo, identidad).
+La Imagen 2 es la habitación de fondo.
+La Imagen 3 en adelante son diferentes vistas de la prenda.
+Colócale a la chica de la Imagen 1 esta prenda mostrada en las imágenes de referencia siendo fiel a la prenda.
+Mantén exactamente su rostro, cuerpo e identidad. Ubícala en la habitación de fondo de la Imagen 2 en formato portrait vertical 9:16.
 """.strip()
 
 DEFAULT_VIDEO_PROMPT = """
-Create one continuous realistic vertical 9:16 Reel.
-The first still image is a prepared master reference and is the only authority
-for the adult woman's identity, room, background, lighting, framing, and
-overall appearance while wearing the garment. The following still images are
-retailer references and are the only authority for the garment's exact front,
-back, collar, sleeves, fabric, seams, fit, color, print, labels, and logos. If
-a source video or textual choreography is provided, use it only for timing,
-movement, gestures, and camera motion.
-
-Recreate the source video's movement using the woman and complete scene from
-the master reference. Keep her face, body shape, hair, room, and garment
-consistent in every frame. Do not preserve the source video's original
-performer, clothing, or background. Do not invent text, patterns, accessories,
-logos, product features, or product claims. Do not add captions or watermarks.
-Keep the result photorealistic and suitable for an Instagram Reel.
-""".strip()
-
-DEFAULT_MOTION_ANALYSIS_PROMPT = """
-Analyze only the visible choreography in this short vertical presenter video.
-Return one concise English direction for a video generator describing the
-chronological body movement, hand gestures, head movement, shot progression,
-camera movement, and approximate timing. Do not mention or describe the
-person's identity, face, hair, body, clothing, room, background, colors, text,
-logos, objects, or audio. Do not add commentary; return only the movement
-direction.
+Recreate the 9:16 vertical video using the base video's motion guidance.
+MANDATORY: Use the exact face, hair, body, identity, and outfit of the model girl from Image 1 (front view) and Image 2 (back view).
+MANDATORY: Use the exact background room environment (walls, furniture, floor, decor, lighting) from Image 1 and Image 2.
+Replace the original person and original environment in the base video with the girl and background from Image 1 and Image 2.
+Keep the background room 100% static, frozen, and still with zero camera motion or distortion.
 """.strip()
 
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -129,9 +89,8 @@ def create_gemini_client(backend: str) -> Any:
     if backend == "vertex":
         project = required_env("GOOGLE_CLOUD_PROJECT")
         location = os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global"
-        # Agent Platform video Interactions use Cloud OAuth/ADC. Do not pass
-        # GEMINI_API_KEY here: the Developer API key is a different backend.
-        return genai.Client(vertexai=True, project=project, location=location)
+        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        return genai.Client(vertexai=True, project=project, location=location, credentials=credentials)
 
     return genai.Client(api_key=required_env("GEMINI_API_KEY"))
 
@@ -312,40 +271,107 @@ def product_image_candidates(page_html: str, page_url: str) -> list[str]:
     return candidates
 
 
-def save_normalized_product_image(raw_image: bytes, output_path: Path) -> bool:
-    """Validate retailer bytes and save a real RGB JPEG for Gemini."""
-
+def scrape_knasta_product(knasta_url: str, output_dir: Path, count: int = 4) -> list[Path]:
+    """Scrape garment images and offer data directly from a Knasta deal URL."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    }
     try:
-        with Image.open(BytesIO(raw_image)) as source:
-            source.load()
-            if source.width < 256 or source.height < 256:
-                return False
-            if source.mode in {"RGBA", "LA"} or "transparency" in source.info:
-                rgba = source.convert("RGBA")
-                normalized = Image.new("RGB", rgba.size, "white")
-                normalized.paste(rgba, mask=rgba.getchannel("A"))
-            else:
-                normalized = source.convert("RGB")
-            normalized.save(
-                output_path,
-                format="JPEG",
-                quality=95,
-                optimize=True,
-            )
-    except (OSError, UnidentifiedImageError, ValueError):
-        return False
-    return True
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
+            resp = client.get(knasta_url)
+            resp.raise_for_status()
+            html = resp.text
+
+        json_ld_matches = re.findall(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
+        product_data = {}
+        for j_text in json_ld_matches:
+            try:
+                data = json.loads(j_text.strip())
+                if isinstance(data, dict) and data.get("@type") == "Product":
+                    product_data = data
+                    break
+            except Exception:
+                continue
+
+        if not product_data:
+            raise PipelineError(f"No se pudo extraer la información del producto de Knasta: {knasta_url}")
+
+        product_name = product_data.get("name", "Producto sin nombre")
+        brand = product_data.get("brand", {}).get("name", "Marca") if isinstance(product_data.get("brand"), dict) else str(product_data.get("brand") or "Marca")
+        offers = product_data.get("offers", {})
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+
+        offer_price = str(offers.get("price", ""))
+        seller = offers.get("seller", {}).get("name", "Retailer") if isinstance(offers.get("seller"), dict) else "Retailer"
+        orig_price_match = re.search(r'Anterior:</span><span[^>]*>\$\s*([\d\.]+)', html)
+        normal_price = orig_price_match.group(1).replace(".", "") if orig_price_match else offer_price
+        disc_match = re.search(r'<span[^>]*>(\d+%)</span>', html)
+        discount_percentage = disc_match.group(1) if disc_match else "0%"
+
+        partner_match = re.search(r'partner_url=([^"&\s]+)', html)
+        if partner_match:
+            retailer_url = unquote(partner_match.group(1))
+            dl_match = re.search(r'dl=([^"&\s]+)', retailer_url)
+            if dl_match:
+                retailer_url = unquote(dl_match.group(1))
+        else:
+            retailer_url = knasta_url
+
+        raw_images = product_data.get("image", [])
+        if isinstance(raw_images, str):
+            raw_images = [raw_images]
+
+        image_urls = []
+        for img_url in raw_images:
+            upgraded_url = re.sub(r'w=\d+,h=\d+', 'w=1000,h=1000', img_url)
+            image_urls.append(upgraded_url)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        downloaded: list[Path] = []
+        downloaded_urls: list[str] = []
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
+            for idx, img_url in enumerate(image_urls[:count], 1):
+                try:
+                    img_resp = client.get(img_url)
+                    img_resp.raise_for_status()
+                    img_path = output_dir / f"{idx:02d}-prenda.jpg"
+                    img_path.write_bytes(img_resp.content)
+                    downloaded.append(img_path)
+                    downloaded_urls.append(img_url)
+                except Exception as exc:
+                    print(f"Advertencia: no se pudo descargar la imagen {img_url}: {exc}")
+
+        if not downloaded:
+            raise PipelineError("No se pudieron descargar imágenes del producto desde Knasta")
+
+        offer_json = {
+            "product_name": product_name,
+            "brand": brand,
+            "retailer": seller,
+            "normal_price": normal_price,
+            "offer_price": offer_price,
+            "discount_percentage": discount_percentage,
+            "url": retailer_url,
+            "knasta_url": knasta_url
+        }
+        (output_dir / "offer.json").write_text(json.dumps(offer_json, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (output_dir / "source.json").write_text(json.dumps({"product_url": knasta_url, "image_urls": downloaded_urls}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return downloaded
+    except Exception as exc:
+        if isinstance(exc, PipelineError):
+            raise
+        raise PipelineError(f"Error al procesar la ficha de Knasta: {exc}") from exc
 
 
 def download_product_images(product_url: str, output_dir: Path, count: int = 4) -> list[Path]:
-    """Download garment photos from a public Falabella product page.
-
-    Knasta is used to discover the deal; this function intentionally receives
-    the official retailer product URL instead of scraping Knasta's database.
-    """
-
+    """Download garment images from Knasta or Falabella product pages."""
     parsed = urlparse(product_url)
     hostname = (parsed.hostname or "").lower()
+    if "knasta.cl" in hostname or "knasta.com" in hostname:
+        return scrape_knasta_product(product_url, output_dir, count)
+
     allowed_host = (
         hostname in {"falabella.com", "falabella.cl"}
         or hostname.endswith(".falabella.com")
@@ -353,8 +379,7 @@ def download_product_images(product_url: str, output_dir: Path, count: int = 4) 
     )
     if parsed.scheme != "https" or not allowed_host:
         raise PipelineError(
-            "--product-url debe ser una ficha HTTPS de Falabella obtenida desde Knasta; "
-            "no se descarga la base de imágenes de Knasta."
+            "--product-url debe ser una ficha HTTPS de Knasta (knasta.cl) o Falabella."
         )
     if count <= 0:
         raise PipelineError("La cantidad de imágenes a descargar debe ser mayor que cero")
@@ -387,11 +412,14 @@ def download_product_images(product_url: str, output_dir: Path, count: int = 4) 
                     image_response.raise_for_status()
                 except httpx.HTTPError:
                     continue
+                content_type = image_response.headers.get("content-type", "").split(";", 1)[0].lower()
+                extension = mimetypes.guess_extension(content_type or "") or Path(urlparse(image_url).path).suffix.lower()
+                if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    extension = ".jpg"
                 if not image_response.content or len(image_response.content) > 20 * 1024 * 1024:
                     continue
-                image_path = output_dir / f"{len(downloaded) + 1:02d}-prenda.jpg"
-                if not save_normalized_product_image(image_response.content, image_path):
-                    continue
+                image_path = output_dir / f"{len(downloaded) + 1:02d}-prenda{extension}"
+                image_path.write_bytes(image_response.content)
                 downloaded.append(image_path)
                 downloaded_urls.append(image_url)
 
@@ -493,7 +521,13 @@ def gcloud_binary() -> str:
     configured = os.getenv("GCLOUD_BIN", "").strip()
     if configured:
         return configured
-    return shutil.which("gcloud") or str(Path.home() / "google-cloud-sdk" / "bin" / "gcloud")
+    return (
+        shutil.which("gcloud")
+        or shutil.which("gcloud.cmd")
+        or str(Path.home() / "AppData" / "Local" / "Google" / "Cloud SDK" / "google-cloud-sdk" / "bin" / "gcloud.cmd")
+        or str(Path.home() / "google-cloud-sdk" / "bin" / "gcloud.cmd")
+        or "gcloud"
+    )
 
 
 def upload_to_gcs(path: Path, bucket: str) -> str:
@@ -511,6 +545,181 @@ def upload_to_gcs(path: Path, bucket: str) -> str:
         detail = (exc.stderr or exc.stdout or str(exc)).strip()
         raise PipelineError(f"No se pudo subir {path.name} a Cloud Storage: {detail}") from exc
     return uri
+
+
+def gcs_bucket() -> str:
+    bucket = os.getenv("GEMINI_GCS_BUCKET", "").strip()
+    if bucket.startswith("gs://"):
+        bucket = bucket[5:]
+    return bucket.rstrip("/")
+
+
+def cloudinary_credentials() -> tuple[str, str, str]:
+    """Parse CLOUDINARY_URL without exposing its API secret."""
+
+    raw_url = os.getenv("CLOUDINARY_URL", "").strip()
+    if not raw_url:
+        raise PipelineError("Falta CLOUDINARY_URL en el archivo .env")
+
+    parsed = urlparse(raw_url)
+    cloud_name = unquote(parsed.hostname or "")
+    api_key = unquote(parsed.username or "")
+    api_secret = unquote(parsed.password or "")
+    if parsed.scheme != "cloudinary" or not cloud_name or not api_key or not api_secret:
+        raise PipelineError(
+            "CLOUDINARY_URL debe tener el formato cloudinary://API_KEY:API_SECRET@CLOUD_NAME"
+        )
+    return cloud_name, api_key, api_secret
+
+
+def upload_video_to_cloudinary(video_path: Path) -> str:
+    """Upload a local MP4 and return its public HTTPS delivery URL."""
+
+    cloud_name, api_key, api_secret = cloudinary_credentials()
+    timestamp = str(int(time.time()))
+    public_id = f"instagram-reels/{video_path.stem}-{timestamp}"
+    signed_params = {"public_id": public_id, "timestamp": timestamp}
+    signature_base = "&".join(
+        f"{key}={signed_params[key]}" for key in sorted(signed_params)
+    )
+    signature = hashlib.sha1(
+        f"{signature_base}{api_secret}".encode("utf-8")
+    ).hexdigest()
+    endpoint = f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload"
+    form_data = {
+        "api_key": api_key,
+        "timestamp": timestamp,
+        "public_id": public_id,
+        "signature": signature,
+    }
+
+    try:
+        with video_path.open("rb") as video_file:
+            response = httpx.post(
+                endpoint,
+                data=form_data,
+                files={"file": (video_path.name, video_file, "video/mp4")},
+                timeout=positive_int_env("CLOUDINARY_TIMEOUT_SECONDS", 600),
+            )
+    except (OSError, httpx.HTTPError) as exc:
+        raise PipelineError(f"Cloudinary no respondió al subir el video: {exc}") from exc
+    if response.is_error:
+        raise PipelineError(f"Cloudinary falló al subir el video: {response.text}")
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise PipelineError("Cloudinary devolvió una respuesta inválida") from exc
+    public_url = str(result.get("secure_url") or "").strip()
+    if not public_url.startswith("https://"):
+        raise PipelineError("Cloudinary no devolvió una URL HTTPS pública")
+    return public_url
+
+
+def gcloud_binary() -> str:
+    configured = os.getenv("GCLOUD_BIN", "").strip()
+    if configured:
+        return configured
+    return (
+        shutil.which("gcloud")
+        or shutil.which("gcloud.cmd")
+        or str(Path.home() / "AppData" / "Local" / "Google" / "Cloud SDK" / "google-cloud-sdk" / "bin" / "gcloud.cmd")
+        or str(Path.home() / "google-cloud-sdk" / "bin" / "gcloud.cmd")
+        or "gcloud"
+    )
+
+
+def upload_to_gcs(path: Path, bucket: str) -> str:
+    uri = f"gs://{bucket}/inputs/{path.name}"
+    try:
+        subprocess.run(
+            [gcloud_binary(), "storage", "cp", "--quiet", str(path), uri],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise PipelineError("No se encontró gcloud para subir el archivo a Cloud Storage") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise PipelineError(f"No se pudo subir {path.name} a Cloud Storage: {detail}") from exc
+    return uri
+
+
+def to_png_file_tuple(image_path: Path, filename: str) -> tuple[str, io.BytesIO, str]:
+    """Open an image, convert to RGB, and return a tuple suitable for OpenAI API file uploads."""
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        buf.name = f"{filename}.png"
+        return (f"{filename}.png", buf, "image/png")
+
+
+def crop_head_from_image(image_path: Path, output_dir: Path, crop_ratio: float = 0.22) -> Path:
+    """Crop out the top portion (head/face) of an image to keep only the garment and body."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"cropped_ref_{image_path.stem}.png"
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        w, h = img.size
+        top_offset = int(h * crop_ratio)
+        cropped_img = img.crop((0, top_offset, w, h))
+        cropped_img.save(out_path, format="PNG")
+    print(f"Imagen de referencia recortada sin rostro ({int(crop_ratio*100)}% superior eliminado): {out_path}")
+    return out_path
+
+
+def generate_outfit_image(
+    model_image: Path,
+    garment_images: list[Path],
+    mask: Path | None,
+    output_path: Path,
+    prompt: str,
+    garment_description: str | None = None,
+    background_image: Path | None = None,
+) -> None:
+    """Create the virtual try-on image with GPT Image 2."""
+
+    client = OpenAI(api_key=required_env("OPENAI_API_KEY"))
+    if not garment_images:
+        raise PipelineError("Debes entregar al menos una imagen de la prenda")
+
+    image_tuples = [to_png_file_tuple(model_image, "model")]
+    if background_image and background_image.is_file():
+        image_tuples.append(to_png_file_tuple(background_image, "background"))
+    for i, path in enumerate(garment_images, 1):
+        image_tuples.append(to_png_file_tuple(path, f"garment_{i}"))
+
+    mask_tuple = to_png_file_tuple(mask, "mask") if mask else None
+
+    final_prompt = prompt
+    if garment_description:
+        final_prompt = f"{prompt}\nDetalles adicionales de la prenda: {garment_description}"
+
+    try:
+        request: dict[str, Any] = {
+            "model": "gpt-image-2",
+            "image": image_tuples,
+            "prompt": final_prompt,
+            "size": "1024x1536",
+            "quality": os.getenv("OPENAI_IMAGE_QUALITY", "low").strip() or "low",
+        }
+        if mask_tuple:
+            request["mask"] = mask_tuple
+
+        try:
+            result = client.images.edit(**request)
+        except Exception as exc:
+            raise PipelineError(f"OpenAI no pudo generar la imagen de outfit: {exc}") from exc
+    finally:
+        pass
+
+    if not result.data or not result.data[0].b64_json:
+        raise PipelineError("OpenAI no devolvió una imagen de outfit")
+
+    output_path.write_bytes(base64.b64decode(result.data[0].b64_json))
 
 
 def resource_state(resource: Any) -> str:
@@ -553,58 +762,19 @@ def wait_for_gemini_interaction(client: Any, interaction: Any) -> Any:
         if status == "completed":
             return current
         if status in {"failed", "cancelled", "incomplete", "budget_exceeded"}:
-            detail = interaction_error_detail(current)
+            detail = (
+                getattr(current, "error", None)
+                or getattr(current, "failure_reason", None)
+                or getattr(current, "reason", None)
+            )
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("detail") or detail
             suffix = f" Detalle: {detail}" if detail else ""
             raise PipelineError(f"Gemini terminó la interacción con estado: {status}.{suffix}")
         time.sleep(poll_seconds)
         current = client.interactions.get(id=interaction_id)
 
     raise PipelineError("Tiempo agotado esperando la interacción de Gemini")
-
-
-def interaction_error_detail(interaction: Any) -> str:
-    """Extract a compact provider error without dumping media payloads."""
-
-    def find_error(value: Any, depth: int = 0) -> Any:
-        if depth > 4 or value is None:
-            return None
-        if isinstance(value, dict):
-            for key in ("error", "failure_reason", "reason", "message", "detail"):
-                if value.get(key):
-                    return value[key]
-            for nested in value.values():
-                found = find_error(nested, depth + 1)
-                if found:
-                    return found
-            return None
-        if isinstance(value, (list, tuple)):
-            for nested in value:
-                found = find_error(nested, depth + 1)
-                if found:
-                    return found
-            return None
-        return None
-
-    detail = find_error(interaction)
-    if detail is None:
-        for method_name in ("model_dump", "to_dict"):
-            method = getattr(interaction, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                detail = find_error(
-                    method(exclude_none=True) if method_name == "model_dump" else method()
-                )
-            except Exception:
-                continue
-            if detail is not None:
-                break
-
-    if isinstance(detail, dict):
-        detail = detail.get("message") or detail.get("detail") or detail.get("reason") or detail
-    if detail is None:
-        return ""
-    return str(detail).strip()
 
 
 def file_name_from_uri(uri: str) -> str:
@@ -618,6 +788,161 @@ def file_name_from_uri(uri: str) -> str:
 
 
 def save_gemini_video(client: Any, interaction: Any, output_path: Path) -> None:
+    steps = getattr(interaction, "steps", None) or []
+    for step in reversed(steps):
+        step_type = getattr(step, "type", None) or (step.get("type") if isinstance(step, dict) else None)
+        if step_type == "model_output":
+            content = getattr(step, "content", None) or (step.get("content") if isinstance(step, dict) else [])
+            for item in content:
+                item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+                if item_type == "video":
+                    data = getattr(item, "data", None) or (item.get("data") if isinstance(item, dict) else None)
+                    if data:
+                        if isinstance(data, str):
+                            output_path.write_bytes(base64.b64decode(data))
+                        else:
+                            output_path.write_bytes(bytes(data))
+                        return
+                    uri = getattr(item, "uri", None) or (item.get("uri") if isinstance(item, dict) else None)
+                    if uri:
+                        if str(uri).startswith("gs://"):
+                            subprocess.run([gcloud_binary(), "storage", "cp", "--quiet", str(uri), str(output_path)], check=True, capture_output=True, text=True)
+                            return
+                        wait_for_gemini_file(client, file_name_from_uri(uri))
+                        video_bytes = client.files.download(file=uri)
+                        if hasattr(video_bytes, "read"):
+                            video_bytes = video_bytes.read()
+                        output_path.write_bytes(bytes(video_bytes))
+                        return
+
+    output_video = getattr(interaction, "output_video", None)
+    if output_video is None:
+        raise PipelineError("Gemini no devolvió un objeto de video")
+
+    inline_data = getattr(output_video, "data", None)
+    if inline_data:
+        if isinstance(inline_data, str):
+            output_path.write_bytes(base64.b64decode(inline_data))
+        else:
+            output_path.write_bytes(bytes(inline_data))
+        return
+
+    uri = getattr(output_video, "uri", None)
+    if not uri:
+        raise PipelineError("Gemini no devolvió ni data ni uri para el video")
+
+    if str(uri).startswith("gs://"):
+        try:
+            subprocess.run(
+                [gcloud_binary(), "storage", "cp", "--quiet", str(uri), str(output_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise PipelineError("No se encontró gcloud para descargar el video generado") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise PipelineError(f"No se pudo descargar el video generado: {detail}") from exc
+        return
+    output_path.write_bytes(base64.b64decode(result.data[0].b64_json))
+
+
+def resource_state(resource: Any) -> str:
+    state = getattr(resource, "state", None)
+    name = getattr(state, "name", state)
+    value = getattr(name, "value", name)
+    return str(value or "").upper()
+
+
+def wait_for_gemini_file(client: Any, file_name: str) -> Any:
+    timeout = positive_int_env("GEMINI_TIMEOUT_SECONDS", 1200)
+    poll_seconds = positive_int_env("GEMINI_POLL_SECONDS", 5)
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        resource = client.files.get(name=file_name)
+        state = resource_state(resource)
+        if state in {"ACTIVE", "SUCCEEDED", "COMPLETED"}:
+            return resource
+        if state in {"FAILED", "ERROR", "CANCELLED"}:
+            raise PipelineError(f"Gemini no pudo procesar {file_name}: {state}")
+        print(f"Gemini: {file_name} está {state or 'PROCESSING'}...")
+        time.sleep(poll_seconds)
+
+    raise PipelineError(f"Tiempo agotado esperando a Gemini: {file_name}")
+
+
+def wait_for_gemini_interaction(client: Any, interaction: Any) -> Any:
+    timeout = positive_int_env("GEMINI_TIMEOUT_SECONDS", 1200)
+    poll_seconds = positive_int_env("GEMINI_POLL_SECONDS", 10)
+    interaction_id = getattr(interaction, "id", None)
+    if not interaction_id:
+        raise PipelineError("Gemini no devolvió un ID de interacción")
+
+    deadline = time.monotonic() + timeout
+    current = interaction
+    while time.monotonic() < deadline:
+        status = str(getattr(current, "status", "")).lower()
+        print(f"Gemini: interacción {status or 'in_progress'}...")
+        if status == "completed":
+            return current
+        if status in {"failed", "cancelled", "incomplete", "budget_exceeded"}:
+            detail = (
+                getattr(current, "error", None)
+                or getattr(current, "failure_reason", None)
+                or getattr(current, "reason", None)
+                or str(current)
+            )
+            print(f"Detalle completo de error Gemini: {detail}")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("detail") or detail
+            suffix = f" Detalle: {detail}" if detail else ""
+            raise PipelineError(f"Gemini terminó la interacción con estado: {status}.{suffix}")
+        time.sleep(poll_seconds)
+        current = client.interactions.get(id=interaction_id)
+
+    raise PipelineError("Tiempo agotado esperando la interacción de Gemini")
+
+
+def file_name_from_uri(uri: str) -> str:
+    parsed = urlparse(uri)
+    last_segment = parsed.path.rstrip("/").split("/")[-1]
+    # URI delivery may contain :download or query parameters.
+    file_id = last_segment.split(":", 1)[0]
+    if file_id.startswith("files/"):
+        return file_id
+    return f"files/{file_id}"
+
+
+def save_gemini_video(client: Any, interaction: Any, output_path: Path) -> None:
+    steps = getattr(interaction, "steps", None) or []
+    for step in reversed(steps):
+        step_type = getattr(step, "type", None) or (step.get("type") if isinstance(step, dict) else None)
+        if step_type == "model_output":
+            content = getattr(step, "content", None) or (step.get("content") if isinstance(step, dict) else [])
+            for item in content:
+                item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+                if item_type == "video":
+                    data = getattr(item, "data", None) or (item.get("data") if isinstance(item, dict) else None)
+                    if data:
+                        if isinstance(data, str):
+                            output_path.write_bytes(base64.b64decode(data))
+                        else:
+                            output_path.write_bytes(bytes(data))
+                        return
+                    uri = getattr(item, "uri", None) or (item.get("uri") if isinstance(item, dict) else None)
+                    if uri:
+                        if str(uri).startswith("gs://"):
+                            subprocess.run([gcloud_binary(), "storage", "cp", "--quiet", str(uri), str(output_path)], check=True, capture_output=True, text=True)
+                            return
+                        wait_for_gemini_file(client, file_name_from_uri(uri))
+                        video_bytes = client.files.download(file=uri)
+                        if hasattr(video_bytes, "read"):
+                            video_bytes = video_bytes.read()
+                        output_path.write_bytes(bytes(video_bytes))
+                        return
+
     output_video = getattr(interaction, "output_video", None)
     if output_video is None:
         raise PipelineError("Gemini no devolvió un objeto de video")
@@ -656,233 +981,70 @@ def save_gemini_video(client: Any, interaction: Any, output_path: Path) -> None:
     output_path.write_bytes(bytes(video_bytes))
 
 
-def generate_master_reference_image(
-    model_image: Path,
-    garment_images: list[Path],
-    output_path: Path,
-    prompt: str,
-) -> None:
-    """Dress the model with the exact garment using Nano Banana 2."""
-
-    if not garment_images:
-        raise PipelineError("Nano Banana 2 necesita al menos una foto de la prenda")
-
-    backend = gemini_backend()
-    client = create_gemini_client(backend)
-    model = (
-        os.getenv("NANO_BANANA_MODEL", "gemini-3.1-flash-image").strip()
-        or "gemini-3.1-flash-image"
-    )
-    aspect_ratio = os.getenv("NANO_BANANA_ASPECT_RATIO", "9:16").strip() or "9:16"
-    if aspect_ratio not in {
-        "1:1",
-        "2:3",
-        "3:2",
-        "3:4",
-        "4:3",
-        "4:5",
-        "5:4",
-        "9:16",
-        "16:9",
-        "21:9",
-    }:
-        raise PipelineError("NANO_BANANA_ASPECT_RATIO no es válido")
-    image_size = os.getenv("NANO_BANANA_IMAGE_SIZE", "2K").strip().upper() or "2K"
-    if image_size not in {"512", "1K", "2K", "4K"}:
-        raise PipelineError("NANO_BANANA_IMAGE_SIZE debe ser 512, 1K, 2K o 4K")
-
-    contents: list[Any] = [prompt]
-    for reference_image in [model_image, *garment_images]:
-        contents.append(
-            types.Part.from_bytes(
-                data=reference_image.read_bytes(),
-                mime_type=image_mime_type(reference_image),
-            )
-        )
-
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=[types.Modality.IMAGE],
-                image_config=types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    output_mime_type="image/jpeg",
-                ),
-            ),
-        )
-    except Exception as exc:
-        provider = "Google Cloud" if backend == "vertex" else "Gemini API"
-        raise PipelineError(
-            f"{provider} no pudo crear la imagen maestra con Nano Banana 2: {exc}"
-        ) from exc
-
-    candidates = getattr(response, "candidates", None) or []
-    for candidate in candidates:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", None) or []:
-            inline_data = getattr(part, "inline_data", None)
-            image_data = getattr(inline_data, "data", None)
-            if image_data:
-                output_path.write_bytes(bytes(image_data))
-                return
-
-    feedback = getattr(response, "prompt_feedback", None)
-    block_reason = getattr(feedback, "block_reason", None)
-    suffix = f" Motivo: {block_reason}" if block_reason else ""
-    raise PipelineError(f"Nano Banana 2 no devolvió una imagen.{suffix}")
-
-
-def describe_video_motion(video_path: Path) -> str:
-    """Convert a movement clip into choreography without carrying over its scene."""
-
-    backend = gemini_backend()
-    client = create_gemini_client(backend)
-    model = (
-        os.getenv("GEMINI_MOTION_MODEL", "gemini-3-flash-preview").strip()
-        or "gemini-3-flash-preview"
-    )
-    prompt = (
-        os.getenv("GEMINI_MOTION_PROMPT", "").strip()
-        or DEFAULT_MOTION_ANALYSIS_PROMPT
-    )
-    contents: list[Any] = [
-        prompt,
-        types.Part.from_bytes(
-            data=video_path.read_bytes(),
-            mime_type="video/mp4",
-        ),
-    ]
-
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=[types.Modality.TEXT],
-                temperature=0.1,
-            ),
-        )
-    except Exception as exc:
-        provider = "Google Cloud" if backend == "vertex" else "Gemini API"
-        raise PipelineError(
-            f"{provider} no pudo analizar el movimiento del video base: {exc}"
-        ) from exc
-
-    try:
-        description = str(getattr(response, "text", "") or "").strip()
-    except (ValueError, AttributeError):
-        description = ""
-    if not description:
-        for candidate in getattr(response, "candidates", None) or []:
-            content = getattr(candidate, "content", None)
-            for part in getattr(content, "parts", None) or []:
-                text = getattr(part, "text", None)
-                if text:
-                    description = str(text).strip()
-                    break
-            if description:
-                break
-    if not description:
-        raise PipelineError("Gemini no devolvió una descripción del movimiento")
-    return description
-
-
 def generate_video(
-    reference_images: list[Path],
+    references: Path | list[Path],
     base_video: Path | None,
     output_path: Path,
     prompt: str,
+    garment_images: list[Path] | None = None,
 ) -> None:
-    """Animate a prepared master image using the movement video and garment references."""
+    """Animate the outfit image/references, optionally preserving motion from a source video."""
 
-    if not reference_images:
-        raise PipelineError("Debes entregar una imagen maestra como referencia visual")
     backend = gemini_backend()
+    if backend == "vertex":
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GOOGLE_API_KEY", None)
+
     client = create_gemini_client(backend)
     aspect_ratio = os.getenv("GEMINI_ASPECT_RATIO", "9:16").strip() or "9:16"
     if aspect_ratio not in {"9:16", "16:9"}:
         raise PipelineError("GEMINI_ASPECT_RATIO debe ser '9:16' o '16:9'")
     duration = duration_env("GEMINI_VIDEO_DURATION", "10s")
+    
+    ref_list = [references] if isinstance(references, Path) else references
     inputs: list[dict[str, Any]] = []
-    bucket = gcs_bucket() if backend == "vertex" else ""
-
-    if base_video:
-        if backend == "vertex":
-            if bucket:
-                inputs.append(
-                    {
-                        "type": "video",
-                        "uri": upload_to_gcs(base_video, bucket),
-                        "mime_type": "video/mp4",
-                    }
-                )
-            else:
-                inputs.append(
-                    {
-                        "type": "video",
-                        "data": encode_base64(base_video),
-                        "mime_type": "video/mp4",
-                    }
-                )
-        else:
-            # Use inline video data for AI Studio. This avoids FileService
-            # restrictions on API keys while keeping short Reels self-contained.
-            inputs.append(
-                {
-                    "type": "video",
-                    "data": encode_base64(base_video),
-                    "mime_type": "video/mp4",
-                }
-            )
-
-    for reference_image in reference_images:
-        if bucket:
+    for ref in ref_list:
+        inputs.append(
+            {
+                "type": "image",
+                "data": encode_base64(ref),
+                "mime_type": image_mime_type(ref),
+            }
+        )
+    if garment_images:
+        for g_img in garment_images:
             inputs.append(
                 {
                     "type": "image",
-                    "uri": upload_to_gcs(reference_image, bucket),
-                    "mime_type": image_mime_type(reference_image),
+                    "data": encode_base64(g_img),
+                    "mime_type": image_mime_type(g_img),
                 }
             )
-        else:
-            inputs.append(
-                {
-                    "type": "image",
-                    "data": encode_base64(reference_image),
-                    "mime_type": image_mime_type(reference_image),
-                }
-            )
+
+    task_mode = os.getenv("GEMINI_VIDEO_TASK", "image_to_video").strip() or "image_to_video"
+
+    if base_video and task_mode == "edit":
+        inputs.append(
+            {
+                "type": "video",
+                "data": encode_base64(base_video),
+                "mime_type": "video/mp4",
+            }
+        )
+
     inputs.append({"type": "text", "text": prompt})
 
     request: dict[str, Any] = {
         "model": "gemini-omni-flash-preview",
         "input": inputs,
-    }
-    # With a source video, Omni infers the edit operation from the video,
-    # references, and prompt. Google's own-video edit example omits task;
-    # keep the explicit task only for reference-to-video generation.
-    if not base_video:
-        request["generation_config"] = {
+        "generation_config": {
             "video_config": {
-                "task": "reference_to_video" if backend == "vertex" else "image_to_video"
+                "task": task_mode
             }
-        }
-    # Omni's uploaded-video edit schema derives the output geometry and
-    # duration from the source video. The API rejects aspect_ratio (and other
-    # generation controls) inside response_format for that task.
+        },
+    }
+
     video_response_format: dict[str, Any] = {"type": "video"}
-    if backend == "vertex" and bucket:
-        video_response_format.update(
-            {
-                "delivery": "uri",
-                "gcs_uri": f"gs://{bucket}/outputs/",
-            }
-        )
-    elif backend != "vertex":
-        video_response_format["delivery"] = "uri"
     if not base_video:
         video_response_format.update(
             {
@@ -890,14 +1052,17 @@ def generate_video(
                 "duration": duration,
             }
         )
+
     if backend == "vertex":
-        # Agent Platform uses a list of response formats for video requests.
         request["response_format"] = [video_response_format]
         request["background"] = True
     else:
         request["response_format"] = video_response_format
 
     try:
+        if backend == "vertex":
+            os.environ.pop("GEMINI_API_KEY", None)
+            os.environ.pop("GOOGLE_API_KEY", None)
         interaction = client.interactions.create(**request)
     except Exception as exc:
         if backend == "vertex":
@@ -912,6 +1077,34 @@ def generate_video(
     if backend == "vertex":
         interaction = wait_for_gemini_interaction(client, interaction)
     save_gemini_video(client, interaction, output_path)
+    remove_gemini_watermark(output_path)
+
+
+def remove_gemini_watermark(video_path: Path) -> None:
+    """Micro-crop bottom 2.5% of frame to eliminate Gemini's SynthID watermark."""
+    try:
+        from moviepy import VideoFileClip
+        clip = VideoFileClip(str(video_path))
+        w, h = clip.size
+        crop_h = int(h * 0.975)
+        cropped = clip.cropped(x1=0, y1=0, width=w, height=crop_h)
+        scaled = cropped.resized((w, h))
+        temp_out = video_path.parent / f"clean_{video_path.name}"
+        scaled.write_videofile(
+            str(temp_out),
+            codec="libx264",
+            audio_codec="aac",
+            fps=clip.fps or 24,
+            logger=None
+        )
+        clip.close()
+        cropped.close()
+        scaled.close()
+        if temp_out.exists() and temp_out.stat().st_size > 0:
+            temp_out.replace(video_path)
+            print("[Pipeline] Marca de agua de Gemini eliminada mediante micro-recorte limpio.")
+    except Exception as exc:
+        print(f"Aviso al limpiar marca de agua: {exc}")
 
 
 def response_text(response: Any) -> str:
@@ -1043,6 +1236,32 @@ def generate_voiceover(script: str, output_path: Path) -> None:
     output_path.write_bytes(response.content)
 
 
+def words_from_narration(text: str, audio_path: Path, output_path: Path) -> list[dict[str, Any]]:
+    """Generate word-level timestamps directly from narration text and audio duration without Groq."""
+    try:
+        from moviepy import AudioFileClip
+    except ImportError as exc:
+        raise PipelineError("Falta moviepy; ejecuta pip install -r requirements.txt") from exc
+
+    raw_words = [w.strip() for w in re.split(r"\s+", text) if w.strip()]
+    if not raw_words:
+        raise PipelineError("El texto de narración está vacío")
+
+    audio = AudioFileClip(str(audio_path))
+    duration = float(audio.duration)
+    audio.close()
+
+    time_per_word = duration / len(raw_words)
+    words: list[dict[str, Any]] = []
+    for idx, word in enumerate(raw_words):
+        start = round(idx * time_per_word, 2)
+        end = round((idx + 1) * time_per_word, 2)
+        words.append({"word": word, "start": start, "end": end})
+
+    output_path.write_text(json.dumps(words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return words
+
+
 def transcription_words(media_path: Path, output_path: Path) -> list[dict[str, Any]]:
     """Transcribe one audio track and persist word-level timestamps."""
 
@@ -1114,6 +1333,9 @@ def caption_font() -> str:
     configured = os.getenv("CAPTION_FONT", "").strip()
     candidates = [
         configured,
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         "/Library/Fonts/Arial Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -1159,6 +1381,134 @@ def attach_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
         video.close()
 
 
+def render_hyperframes_subtitles(video_path: Path, words: list[dict[str, Any]], output_path: Path) -> None:
+    """Render aesthetic captions using HyperFrames with Google Font 'Outfit'."""
+    try:
+        html_dir = output_path.parent / f"hyperframes-{int(time.time())}"
+        html_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy video locally to avoid file:// security blocks in Puppeteer
+        local_bg = html_dir / "bg.mp4"
+        shutil.copy(video_path, local_bg)
+        
+        html_file = html_dir / "index.html"
+        words_json = json.dumps(words, ensure_ascii=False)
+
+        html_content = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>HyperFrames Captions - Outfit</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@700;800;900&display=swap');
+
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+
+        body, html {{
+            width: 1080px;
+            height: 1920px;
+            overflow: hidden;
+            background: #000;
+            font-family: 'Outfit', sans-serif;
+        }}
+
+        #bg-video {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 1080px;
+            height: 1920px;
+            object-fit: cover;
+        }}
+
+        .caption-container {{
+            position: absolute;
+            top: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 920px;
+            text-align: center;
+            z-index: 10;
+        }}
+
+        .caption-box {{
+            display: inline-block;
+            background: rgba(0, 0, 0, 0.65);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 2px solid rgba(255, 255, 255, 0.18);
+            border-radius: 26px;
+            padding: 22px 38px;
+            box-shadow: 0 12px 36px rgba(0, 0, 0, 0.65);
+        }}
+
+        .word {{
+            display: inline-block;
+            font-size: 52px;
+            font-weight: 900;
+            color: #FFFFFF;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            margin: 0 7px;
+            transition: all 0.08s ease-in-out;
+            text-shadow: 0 4px 12px rgba(0, 0, 0, 0.85);
+        }}
+
+        .word.active {{
+            color: #FFE600;
+            transform: scale(1.18);
+            text-shadow: 0 0 24px rgba(255, 230, 0, 0.95), 0 4px 14px rgba(0, 0, 0, 0.9);
+        }}
+    </style>
+</head>
+<body>
+    <video id="bg-video" src="./bg.mp4" data-start="0" autoplay muted></video>
+    <div class="caption-container">
+        <div class="caption-box" id="caption-box"></div>
+    </div>
+
+    <script>
+        const words = {words_json};
+        const container = document.getElementById('caption-box');
+        const video = document.getElementById('bg-video');
+
+        function updateCaptions() {{
+            const curTime = video.currentTime;
+            const activeWords = words.filter(w => curTime >= w.start - 0.05 && curTime <= w.end + 0.15);
+            if (activeWords.length > 0) {{
+                container.innerHTML = activeWords.map(w => {{
+                    const isActive = curTime >= w.start && curTime <= w.end;
+                    return `<span class="word ${{isActive ? 'active' : ''}}">${{w.word}}</span>`;
+                }}).join(' ');
+            }} else {{
+                container.innerHTML = '';
+            }}
+            requestAnimationFrame(updateCaptions);
+        }}
+        video.addEventListener('timeupdate', updateCaptions);
+        requestAnimationFrame(updateCaptions);
+    </script>
+</body>
+</html>
+"""
+        html_file.write_text(html_content, encoding="utf-8")
+        
+        npx_bin = shutil.which("npx") or shutil.which("npx.cmd") or "npx"
+        cmd = [npx_bin, "-y", "hyperframes", "render", str(html_dir), "-o", str(output_path), "--resolution=portrait"]
+        print(f"Renderizando subtítulos aesthetic (Outfit) con HyperFrames...")
+        res = subprocess.run(cmd, capture_output=True, text=True, shell=(sys.platform == "win32"), timeout=60)
+        if res.returncode != 0:
+            print(f"HyperFrames aviso: {res.stderr or res.stdout}. Usando MoviePy fallback...")
+            render_subtitles(video_path, words, output_path)
+    except Exception as exc:
+        print(f"Aviso al renderizar con HyperFrames: {exc}. Usando fallback MoviePy...")
+        render_subtitles(video_path, words, output_path)
+
+
 def render_subtitles(video_path: Path, words: list[dict[str, Any]], output_path: Path) -> None:
     """Burn readable captions into a vertical video using MoviePy v2."""
 
@@ -1180,8 +1530,8 @@ def render_subtitles(video_path: Path, words: list[dict[str, Any]], output_path:
         elif caption_position == "bottom":
             position = ("center", int(video.h * 0.74))
         else:
-            # Leave a safe margin below Instagram's top controls.
-            position = ("center", int(video.h * 0.08))
+            # Positioned higher up near top edge of the 9:16 frame
+            position = ("center", int(video.h * 0.04))
         for chunk in caption_chunks(words, max_words=max_words):
             start = max(0.0, float(chunk["start"]))
             end = min(float(video.duration), float(chunk["end"]))
@@ -1217,7 +1567,7 @@ def render_subtitles(video_path: Path, words: list[dict[str, Any]], output_path:
 
 
 def normalize_base_video(video_path: Path, out_dir: Path, stamp: str) -> Path:
-    """Trim source footage and remove audio before sending it to Gemini."""
+    """Trim source footage to Gemini Omni Flash's 10-second input limit."""
 
     try:
         from moviepy import VideoFileClip
@@ -1227,29 +1577,26 @@ def normalize_base_video(video_path: Path, out_dir: Path, stamp: str) -> Path:
     clip = VideoFileClip(str(video_path))
     try:
         duration = float(clip.duration or 0)
-        has_audio = clip.audio is not None
-        if duration <= 10.0 and not has_audio:
+        if duration <= 10.0:
             return video_path
 
-        normalized_path = out_dir / f"source-gemini-{stamp}.mp4"
-        trimmed = clip.subclipped(0, min(duration, 10.0))
+        trimmed_path = out_dir / f"source-trimmed-{stamp}.mp4"
+        trimmed = clip.subclipped(0, 10.0)
         try:
             trimmed.write_videofile(
-                str(normalized_path),
+                str(trimmed_path),
                 codec="libx264",
-                audio=False,
+                audio=clip.audio is not None,
+                audio_codec="aac" if clip.audio is not None else None,
                 fps=clip.fps or 30,
                 logger=None,
             )
         finally:
             trimmed.close()
-        changes: list[str] = []
-        if duration > 10.0:
-            changes.append("recortado a 10.00s")
-        if has_audio:
-            changes.append("sin audio")
-        print(f"Video base normalizado para Gemini ({', '.join(changes)}): {normalized_path}")
-        return normalized_path
+        print(
+            f"Video base de {duration:.2f}s recortado a 10.00s para cumplir el límite de Gemini: {trimmed_path}"
+        )
+        return trimmed_path
     finally:
         clip.close()
 
@@ -1270,6 +1617,37 @@ def meta_json(response: httpx.Response, action: str) -> dict[str, Any]:
     if isinstance(data, dict) and data.get("error"):
         raise PipelineError(f"Instagram falló al {action}: {data['error']}")
     return data
+
+
+def record_published_reel(media_id: str, product_url: str, title: str = "") -> None:
+    """Save media_id to product mapping in published_history.json & Cloudflare KV."""
+    history_file = Path("published_history.json")
+    history = {}
+    if history_file.exists():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+        except Exception:
+            history = {}
+    history[str(media_id)] = {
+        "product_url": product_url,
+        "title": title,
+        "published_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    history_file.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Cloudflare KV Sync
+    worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip()
+    secret = os.getenv("API_SECRET_KEY", "antigravity_api_secret").strip()
+    if worker_url:
+        try:
+            endpoint = f"{worker_url.rstrip('/')}/api/record-reel"
+            headers = {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
+            payload = {"media_id": str(media_id), "product_url": product_url, "title": title}
+            with httpx.Client(timeout=10) as client:
+                r = client.post(endpoint, json=payload, headers=headers)
+                print(f"[Cloudflare Sync] Status: {r.status_code}")
+        except Exception as exc:
+            print(f"[Cloudflare Sync] Aviso al sincronizar con Cloudflare Worker: {exc}")
 
 
 def publish_reel(public_video_url: str, caption: str) -> str:
@@ -1435,8 +1813,78 @@ def publish_tiktok(public_video_url: str, title: str) -> str:
     raise PipelineError("Tiempo agotado esperando a TikTok")
 
 
+def auto_discover_knasta_url(history_file: Path = Path("published_history.json"), query: str = "polera") -> str:
+    """Automatically find the top unpublished deal on Knasta for autonomous execution."""
+    history = set()
+    if history_file.is_file():
+        try:
+            data = json.loads(history_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                # Add both media_id mapping values and published_urls list
+                for item in data.values():
+                    if isinstance(item, dict) and item.get("product_url"):
+                        history.add(item.get("product_url").strip())
+                for u in data.get("published_urls", []):
+                    history.add(u.strip())
+        except Exception:
+            pass
+
+    # Priority category: Falabella Ropa Mujer with >= 30% discount
+    category_urls = [
+        "https://knasta.cl/results/mujer/ropa-mujer?d=-30&partners=falabella",
+        f"https://knasta.cl/results?q={query}",
+        "https://knasta.cl/results?q=chaqueta",
+        "https://knasta.cl/results?q=vestido"
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+
+    for cat_url in category_urls:
+        try:
+            with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
+                resp = client.get(cat_url)
+                resp.raise_for_status()
+                html = resp.text
+
+            detail_urls = re.findall(r'href="(/detail/[^"]+)"', html)
+            unique_links = list(dict.fromkeys(detail_urls))
+            for rel_path in unique_links:
+                full_url = f"https://knasta.cl{rel_path}"
+                if full_url not in history:
+                    print(f"Auto-descubierta oferta destacada de Falabella en Knasta: {full_url}")
+                    return full_url
+        except Exception as exc:
+            print(f"Advertencia al consultar Knasta URL '{cat_url}': {exc}")
+
+    raise PipelineError("No se encontraron ofertas nuevas en Knasta para publicar.")
+
+
+def save_published_history(history_file: Path, url: str) -> None:
+    history = []
+    if history_file.is_file():
+        try:
+            data = json.loads(history_file.read_text(encoding="utf-8"))
+            history = data.get("published_urls", [])
+        except Exception:
+            pass
+    if url not in history:
+        history.append(url)
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        history_file.write_text(json.dumps({"published_urls": history}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Genera y publica automáticamente Reels de ofertas de ropa en Instagram y TikTok."
+    )
+    parser.add_argument(
+        "--auto-discover",
+        action="store_true",
+        help="Descubrir y procesar automáticamente la mejor oferta nueva disponible en Knasta sin intervención humana",
+    )
     parser.add_argument("--model-image", type=Path, help="Foto del modelo/persona")
     parser.add_argument(
         "--garment-image",
@@ -1450,31 +1898,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Carpeta con las imágenes de la prenda; se leen en orden alfabético",
     )
     parser.add_argument(
+        "--garment-description",
+        help="Descripción opcional de la prenda para enriquecer el prompt de generación",
+    )
+    parser.add_argument(
         "--product-url",
         help="Ficha HTTPS oficial de Falabella; descarga cuatro fotos de la prenda antes de generar",
     )
     parser.add_argument(
         "--reference-image",
         type=Path,
-        help="Imagen maestra ya preparada; omite Nano Banana 2 y admite referencias de prenda",
+        help="Imagen existente que Gemini usará como reemplazo en el video",
     )
+    parser.add_argument(
+        "--crop-garment-head",
+        action="store_true",
+        default=True,
+        help="Recortar el rostro/cabeza superior de las imágenes extraídas de la prenda/tienda",
+    )
+    parser.add_argument(
+        "--crop-reference-head",
+        action="store_true",
+        default=False,
+        help="Recortar el rostro/cabeza superior de las imágenes de referencia antes de enviar a Gemini",
+    )
+    parser.add_argument(
+        "--crop-head-ratio",
+        type=float,
+        default=0.22,
+        help="Porcentaje superior a recortar de la imagen (por defecto 0.22)",
+    )
+    parser.add_argument("--mask", type=Path, help="Máscara PNG opcional para la zona de ropa")
     parser.add_argument("--base-video", type=Path, help="Video de movimiento para video-to-video")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
-    parser.add_argument(
-        "--master-prompt",
-        default=os.getenv("NANO_BANANA_PROMPT", "").strip() or DEFAULT_MASTER_IMAGE_PROMPT,
-        help="Prompt para vestir a la modelo con Nano Banana 2",
-    )
+    parser.add_argument("--outfit-prompt", default=DEFAULT_OUTFIT_PROMPT)
     parser.add_argument(
         "--video-prompt",
         default=os.getenv("GEMINI_VIDEO_PROMPT", "").strip() or DEFAULT_VIDEO_PROMPT,
-    )
-    parser.add_argument(
-        "--video-mode",
-        choices=("reference_to_video", "video_edit"),
-        default=os.getenv("GEMINI_VIDEO_MODE", "reference_to_video").strip()
-        or "reference_to_video",
-        help="reference_to_video preserva la escena maestra; video_edit modifica el clip original",
     )
     parser.add_argument("--offer-json", type=Path, help="Oferta JSON para generar un guion comercial")
     parser.add_argument("--generate-script", action="store_true", help="Generar guion con OpenAI desde --offer-json")
@@ -1488,11 +1948,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--publish-both",
         action="store_true",
         help="Publicar el mismo MP4 en Instagram y TikTok después de generar",
-    )
-    parser.add_argument(
-        "--upload-cloudinary",
-        action="store_true",
-        help="Subir el MP4 final a Cloudinary sin publicarlo en redes sociales",
     )
     parser.add_argument("--public-url", help="URL HTTPS pública del MP4 para Instagram/TikTok")
     parser.add_argument("--caption", help="Caption del Reel")
@@ -1509,12 +1964,14 @@ def main() -> int:
     try:
         if args.script_file and args.narration_text:
             raise PipelineError("Usa --script-file o --narration-text, no ambos")
-        if args.generate_script and not args.offer_json:
+        if args.generate_script and not args.offer_json and not args.product_url:
             raise PipelineError("--generate-script necesita --offer-json")
 
-        if args.reference_image and args.model_image:
+        if args.reference_image and (
+            args.model_image or args.garment_image or args.garment_dir or args.product_url
+        ):
             raise PipelineError(
-                "Usa --reference-image o --model-image, no ambos."
+                "Usa --reference-image solo, o usa --model-image junto con las imágenes de la prenda; no mezcles los dos modos."
             )
         if args.product_url and (args.garment_image or args.garment_dir):
             raise PipelineError("Usa --product-url o las imágenes locales de la prenda, no ambos.")
@@ -1522,20 +1979,14 @@ def main() -> int:
         args.out_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+        if args.auto_discover and not args.product_url:
+            args.product_url = auto_discover_knasta_url(args.out_dir / "published_history.json")
+
         if args.reference_image:
-            master_image = validate_input(args.reference_image, "imagen de referencia")
-            garment_images: list[Path] = []
-            if args.product_url:
-                scraped_garment_dir = args.out_dir / f"scraped-garments-{stamp}"
-                print(f"Descargando fotos de la prenda desde Falabella: {args.product_url}")
-                garment_images = download_product_images(args.product_url, scraped_garment_dir)
-            elif args.garment_image or args.garment_dir:
-                garment_images = collect_garment_images(
-                    args.garment_image,
-                    args.garment_dir,
-                )
-            reference_images = [master_image, *garment_images]
-            print("Usando la imagen maestra existente; se omite Nano Banana 2.")
+            video_references = [
+                validate_input(path, "imagen de referencia")
+                for path in args.reference_image
+            ]
         else:
             model_path = args.model_image or default_download_asset(
                 "MODEL_IMAGE_PATH", DEFAULT_MODEL_IMAGE
@@ -1543,60 +1994,86 @@ def main() -> int:
             model_image = validate_input(model_path, "modelo")
             if args.product_url:
                 scraped_garment_dir = args.out_dir / f"scraped-garments-{stamp}"
-                print(f"Descargando fotos de la prenda desde Falabella: {args.product_url}")
+                print(f"Descargando fotos del producto desde: {args.product_url}")
                 garment_images = download_product_images(args.product_url, scraped_garment_dir)
+                if not args.offer_json and (scraped_garment_dir / "offer.json").is_file():
+                    args.offer_json = scraped_garment_dir / "offer.json"
+                if args.voiceover and not args.narration_text and not args.script_file and args.offer_json:
+                    args.generate_script = True
             else:
                 garment_dir = args.garment_dir
                 if garment_dir is None and not args.garment_image:
                     garment_dir = default_download_asset("GARMENT_DIR", DEFAULT_GARMENT_DIR)
                 garment_images = collect_garment_images(args.garment_image, garment_dir)
 
-            master_image = args.out_dir / f"nano-banana-master-{stamp}.jpg"
-            print(
-                "Generando imagen maestra 9:16 con Nano Banana 2 usando "
-                f"la modelo y {len(garment_images)} vista(s) de la prenda..."
-            )
-            generate_master_reference_image(
-                model_image,
-                garment_images,
-                master_image,
-                args.master_prompt,
-            )
-            print(f"Imagen maestra guardada en: {master_image}")
-            reference_images = [master_image, *garment_images]
+            if args.crop_garment_head and garment_images:
+                print("Recortando rostro/cabeza de las imágenes de la prenda...")
+                garment_images = [
+                    crop_head_from_image(img, args.out_dir, crop_ratio=args.crop_head_ratio)
+                    for img in garment_images
+                ]
 
+        if args.generate_script and not args.offer_json:
+            raise PipelineError(
+                "--generate-script no encontró offer.json. Usa --offer-json o una ficha "
+                "de producto que exponga datos de oferta."
+            )
+
+        mask = validate_input(args.mask, "máscara") if args.mask else None
+        if args.base_video:
+            base_video = validate_input(args.base_video, "video base")
         if args.base_video:
             base_video = validate_input(args.base_video, "video base")
         else:
             default_video = default_download_asset("BASE_VIDEO_PATH", DEFAULT_BASE_VIDEO)
             base_video = validate_input(default_video, "video base") if default_video.is_file() else None
 
-        video_prompt = args.video_prompt
-        generation_video = base_video
-        if base_video and args.video_mode == "reference_to_video":
-            print(
-                "Analizando la coreografía del video base con Gemini, "
-                "sin transferir su persona ni su fondo..."
-            )
-            motion_description = describe_video_motion(base_video)
-            print(f"Coreografía detectada: {motion_description}")
-            video_prompt = (
-                f"{video_prompt}\n\n"
-                "Motion choreography to recreate while preserving the master "
-                f"scene exactly:\n{motion_description}"
-            )
-            generation_video = None
-        elif base_video:
+        if base_video:
             base_video = normalize_base_video(base_video, args.out_dir, stamp)
-            generation_video = base_video
         video_path = args.out_dir / f"reel-{stamp}.mp4"
 
+        if args.reference_image:
+            print(
+                "1/2 Usando imágenes de referencia existentes: "
+                + ", ".join(str(path) for path in video_references)
+            )
+        else:
+            outfit_path = args.out_dir / f"outfit-{stamp}.png"
+            print(
+                f"1/3 Generando outfit con GPT Image 2 usando {len(garment_images)} vista(s) de la prenda..."
+            )
+            bg_path_env = os.getenv("BACKGROUND_IMAGE_PATH", "").strip()
+            bg_image = Path(bg_path_env) if bg_path_env and Path(bg_path_env).is_file() else None
+            generate_outfit_image(
+                model_image,
+                garment_images,
+                mask,
+                outfit_path,
+                args.outfit_prompt,
+                garment_description=args.garment_description,
+                background_image=bg_image,
+            )
+            print(f"Imagen guardada en: {outfit_path}")
+            video_references = [outfit_path]
+
+        if args.crop_reference_head:
+            video_references = [
+                crop_head_from_image(ref, args.out_dir, crop_ratio=args.crop_head_ratio)
+                for ref in video_references
+            ]
+
         print(
-            "Animando la imagen maestra con Gemini Omni Flash usando "
-            f"{len(reference_images)} referencia(s) visual(es) en modo "
-            f"{args.video_mode}..."
+            "2/2 Generando video con Gemini Omni Flash..."
+            if args.reference_image
+            else "2/3 Generando video con Gemini Omni Flash..."
         )
-        generate_video(reference_images, generation_video, video_path, video_prompt)
+        generate_video(
+            video_references,
+            base_video,
+            video_path,
+            args.video_prompt,
+            garment_images=garment_images if not args.reference_image else None,
+        )
         final_video_path = video_path
         print(f"Video guardado en: {final_video_path}")
 
@@ -1633,23 +2110,21 @@ def main() -> int:
         if args.subtitles:
             transcription_source = voice_path if args.voiceover else final_video_path
             transcript_path = args.out_dir / f"transcript-{stamp}.json"
-            print(f"Transcribiendo {transcription_source.name} con Groq...")
-            words = transcription_words(transcription_source, transcript_path)
+            if narration:
+                print("Generando marcas de tiempo desde el guion (sin usar Groq)...")
+                words = words_from_narration(narration, transcription_source, transcript_path)
+            else:
+                print(f"Transcribiendo {transcription_source.name} con Groq...")
+                words = transcription_words(transcription_source, transcript_path)
             subtitled_video_path = args.out_dir / f"reel-captioned-{stamp}.mp4"
-            render_subtitles(final_video_path, words, subtitled_video_path)
+            render_hyperframes_subtitles(final_video_path, words, subtitled_video_path)
             final_video_path = subtitled_video_path
             print(f"Video con subtítulos guardado en: {final_video_path}")
-
-        uploaded_public_url = ""
-        if args.upload_cloudinary:
-            print(f"Subiendo {final_video_path.name} a Cloudinary sin publicar...")
-            uploaded_public_url = upload_video_to_cloudinary(final_video_path)
-            print(f"MP4 disponible en: {uploaded_public_url}")
 
         publish_instagram = args.publish or args.publish_both
         publish_tiktok_requested = args.publish_tiktok or args.publish_both
         if publish_instagram or publish_tiktok_requested:
-            public_url = uploaded_public_url or (args.public_url or "").strip()
+            public_url = (args.public_url or "").strip()
             if publish_instagram and not public_url:
                 public_url = os.getenv("INSTAGRAM_VIDEO_URL", "").strip()
             if publish_tiktok_requested and not public_url:
@@ -1680,6 +2155,17 @@ def main() -> int:
                 print(f"Publicando {final_video_path.name} en Instagram...")
                 media_id = publish_reel(public_url, caption)
                 print(f"Reel publicado. Media ID: {media_id}")
+                prod_url = args.product_url or ""
+                prod_title = "la prenda"
+                offer_json_file = args.out_dir / "offer.json"
+                if offer_json_file.is_file():
+                    try:
+                        off_data = json.loads(offer_json_file.read_text(encoding="utf-8"))
+                        prod_url = off_data.get("url") or prod_url
+                        prod_title = off_data.get("product_name") or prod_title
+                    except Exception:
+                        pass
+                record_published_reel(media_id, prod_url, prod_title)
             if publish_tiktok_requested:
                 tiktok_title = (
                     os.getenv("TIKTOK_TITLE", "").strip()

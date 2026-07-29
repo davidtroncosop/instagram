@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "instagram-auto-responder",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "observability": {
+    "enabled": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "PUBLISHED_REELS",
+      "id": "PUBLISHED_REELS_KV_ID"
+    }
+  ]
+}

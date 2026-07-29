@@ -2,9 +2,9 @@
 
 Pipeline en Python para:
 
-1. entregar a Nano Banana 2 la foto de modelo y hasta nueve vistas de la prenda;
-2. crear una imagen maestra 9:16 con `gemini-3.1-flash-image`;
-3. animarla con `gemini-omni-flash-preview` y el movimiento de un video base;
+1. fusionar una foto de modelo con hasta nueve vistas de una prenda usando `gpt-image-2`;
+2. convertir esa imagen en video con `gemini-omni-flash-preview`;
+3. editar un video base conservando su movimiento (`--base-video`);
 4. publicar opcionalmente el mismo MP4 en Instagram y TikTok.
 
 ## Instalación
@@ -17,21 +17,12 @@ pip install -r requirements.txt
 
 Completa `.env` según el backend que quieras usar:
 
-- `OPENAI_API_KEY`: opcional; solo se usa si ejecutas `--generate-script` explícitamente.
+- `OPENAI_API_KEY`: clave de OpenAI.
 - `GEMINI_BACKEND=vertex`: usa Gemini Omni Flash desde Google Cloud Agent Platform.
 - `GOOGLE_CLOUD_PROJECT`: ID del proyecto de GCP con facturación y Agent Platform API.
 - `GOOGLE_CLOUD_LOCATION=global`: ubicación de Gemini Omni Flash.
 - `GEMINI_GCS_BUCKET`: bucket `gs://` opcional para subir los medios de entrada de Vertex; se recomienda para videos locales grandes.
 - `GEMINI_API_KEY`: solo se usa si `GEMINI_BACKEND=ai_studio`.
-- `NANO_BANANA_MODEL=gemini-3.1-flash-image`: modelo de Nano Banana 2 que
-  crea la imagen maestra intermedia.
-- `NANO_BANANA_IMAGE_SIZE=2K` y `NANO_BANANA_ASPECT_RATIO=9:16`: calidad y
-  formato de esa imagen.
-- `GEMINI_VIDEO_MODE=reference_to_video`: Gemini 3 Flash describe solamente la
-  coreografía del clip y Omni anima la imagen maestra sin heredar el fondo del
-  video original. `video_edit` conserva el modo de edición directa como opción.
-- `GEMINI_MOTION_MODEL=gemini-3-flash-preview`: modelo que convierte el clip
-  base en una instrucción breve de movimiento.
 - `INSTAGRAM_ACCESS_TOKEN`: token con permiso de publicación.
 - `INSTAGRAM_USER_ID`: ID de la cuenta profesional de Instagram.
 - `META_API_VERSION`: versión habilitada en tu aplicación de Meta.
@@ -63,6 +54,7 @@ no activa el crédito de GCP.
 
 - `modelo.jpg`: persona/modelo con derechos para usar la imagen.
 - `prendas/`: una o más imágenes de la misma prenda. Para cuatro vistas, usa cuatro archivos PNG/JPG/WEBP.
+- `mask.png`: opcional. Debe tener el mismo tamaño/formato que `modelo.jpg`, incluir canal alpha y marcar la zona que se editará. Si se usa con dos imágenes, la máscara se aplica a la primera (`modelo.jpg`).
 - `movimiento.mp4`: opcional. Si se entrega, Gemini intenta conservar su pose, cámara y movimiento.
 
 ## Uso
@@ -84,8 +76,14 @@ python pipeline.py \
   --garment-image prenda-espalda.png \
   --garment-image prenda-lateral-a.png \
   --garment-image prenda-lateral-b.png \
+  --mask mask.png \
   --base-video movimiento.mp4
 ```
+
+Las fotos originales de la prenda se utilizan como autoridad visual tanto al
+crear la imagen del outfit como al generar el video. La opción opcional
+--garment-description permite añadir detalles que no sean visibles en las
+fotos, pero el flujo no depende de una prenda o categoría concreta.
 
 Con los archivos que tienes en `Descargas`, cuando agregues las cuatro vistas
 de la prenda a `Descargas/prendas/`, puedes ejecutar directamente:
@@ -97,17 +95,17 @@ python pipeline.py
 También puedes indicar otra carpeta explícitamente con
 `--garment-dir "$HOME/Downloads/prendas"`.
 
-Si quieres obtener las cuatro fotos automáticamente, copia la URL de la ficha
-oficial de Falabella encontrada desde Knasta y usa:
+Si quieres obtener hasta cuatro fotos automáticamente, copia la URL HTTPS de
+cualquier ficha de producto y usa:
 
 ```bash
 python pipeline.py \
-  --product-url "https://www.falabella.com/falabella-cl/product/..."
+  --product-url "https://tienda.example/producto/..."
 ```
 
-Knasta se usa para descubrir y comprobar la oferta; las imágenes se descargan
-desde la ficha oficial de Falabella y quedan guardadas en `outputs/` junto con
-un `source.json`. No se descarga la base de imágenes de Knasta.
+La ficha se analiza mediante metadatos HTML/JSON-LD y las imágenes quedan
+guardadas en `outputs/` junto con un `source.json`. Si la tienda bloquea la
+consulta o no expone suficientes fotos, usa `--garment-dir` con imágenes locales.
 
 Ya quedó preparado en este proyecto un lote de prueba real:
 `garments/diadora-poleron/` contiene cuatro vistas del polerón Diadora y
@@ -148,13 +146,9 @@ El script usa automáticamente:
 - `Descargas/ChatGPT_Image_22_jul_2026,_202607252032.jpeg` como modelo y fondo.
 - `Descargas/0718_202607252032.mp4` como video base.
 
-El primer prompt viste a la chica de la foto con la prenda, preservando su
-identidad y el ambiente, y guarda `nano-banana-master-*.jpg`. Omni utiliza
-después esa imagen como autoridad visual. Para evitar que el fondo del clip se
-filtre al resultado, Gemini 3 Flash convierte primero el video base en una
-descripción de su coreografía y Omni recibe esa descripción, no los píxeles del
-clip. Puedes sustituir los prompts con `--master-prompt`, `--video-prompt` y
-`GEMINI_MOTION_PROMPT`.
+El prompt predeterminado reemplaza a la chica del video por la chica de la
+foto, conserva el ambiente de la foto y viste la prenda usando todas sus
+vistas. Puedes sustituirlo con `--outfit-prompt` y `--video-prompt`.
 
 ## Voz y subtítulos opcionales
 
@@ -183,20 +177,20 @@ El video generado por Gemini Omni Flash tiene un límite de 10 segundos. Por
 eso el guion comercial se limita a 28 palabras y sigue un formato breve como:
 `Mira lo que encontré... polerón oversais, de 35 mil bajó a 12 mil dos cincuenta. Quedan pocas tallas. Comenta LOOK y te mando el link...`
 
-Si ya tienes una imagen maestra de la persona vestida con la prenda y en el
-fondo final, puedes entregarla directamente a Omni y omitir Nano Banana 2:
+Si ya tienes una imagen de la persona que quieres usar como reemplazo, puedes
+saltarte GPT Image 2 y usarla directamente como referencia de Gemini:
 
 ```bash
 python pipeline.py \
-  --reference-image imagen-maestra.jpg \
-  --garment-dir prendas \
+  --reference-image persona.jpg \
   --base-video movimiento.mp4 \
-  --video-prompt "Recreate video replace girl"
+  --video-prompt "Usa exactamente la persona y la prenda de las referencias; conserva solo el movimiento del video base."
 ```
 
-En este modo, `--reference-image` ya debe contener la apariencia final y
-`--base-video` es el video cuyo movimiento se quiere conservar. Las referencias
-de prenda son opcionales, pero ayudan a Omni a mantener sus detalles.
+En este modo, `--reference-image` se puede repetir: la primera imagen es la
+vista frontal y la segunda la vista trasera de la misma persona/prenda. Gemini
+recibe ambas referencias junto con el video base; no se debe describir una
+segunda vista en el prompt si solo se envía una imagen.
 
 Los archivos quedan en `outputs/`.
 
@@ -225,8 +219,6 @@ python pipeline.py \
 el contenedor de Reel, espera `FINISHED` y llama a `media_publish`; para TikTok
 inicia el Direct Post y consulta su estado hasta `PUBLISH_COMPLETE`.
 
-Para revisar el MP4 en Cloudinary sin publicar nada, usa `--upload-cloudinary`.
-
 La publicación directa en TikTok requiere una app registrada, el producto
 Content Posting API, autorización del scope `video.publish` y autorización de
 la cuenta creadora. Los clientes no auditados pueden quedar restringidos a
@@ -245,55 +237,11 @@ ManyChat se configura aparte, no dentro de Python:
 
 Incluye la divulgación de afiliado en el caption y/o mensaje, y activa la etiqueta de colaboración pagada cuando corresponda.
 
-## Ejecución autónoma: Cloudflare + Cloud Run + Cloudinary
-
-La infraestructura quedó preparada así:
-
-- Cloudflare Worker: `https://instagram-offers-scheduler.davidtroncosop.workers.dev`.
-  Tiene un cron cada 30 minutos y filtra 08:30, 14:00 y 20:30 en
-  `America/Santiago`, para no depender del horario UTC durante el cambio de hora.
-- Cloud Run: ejecuta el contenedor Python con MoviePy, FFmpeg, Vertex AI,
-  Fish Audio, Groq, Cloudinary e Instagram.
-- Secret Manager: guarda las claves privadas; no se copian al Worker ni a git.
-- Cloudinary: entrega la URL HTTPS pública que Instagram necesita para leer el MP4.
-
-La automatización y la publicación están desactivadas mientras se verifica una
-ejecución manual: `ENABLE_AUTOMATION=false` y `PUBLISH_ENABLED=false`. Para
-activarlas, cambia esos dos valores en `deploy/cloudflare-worker/wrangler.toml`
-y ejecuta:
-
-```bash
-wrangler deploy --config=deploy/cloudflare-worker/wrangler.toml --keep-vars
-```
-
-El scraper de Knasta ya está integrado. Lee el JSON público que acompaña a las
-páginas `/results`, filtra Falabella, exige una rebaja real mínima de 30% y
-entrega una ficha oficial del retailer para que el pipeline descargue las
-cuatro fotos desde Falabella. No consulta `/api`, no sigue `/redirect` y respeta
-`robots.txt` y una pausa entre búsquedas.
-
-Puedes probarlo localmente sin generar video:
-
-```bash
-python knasta_scraper.py \
-  --terms "poleron levis" \
-  --min-discount 30 \
-  --limit 3 \
-  --narration
-```
-
-El endpoint protegido `GET /offers` del Worker permite comprobar las ofertas
-en producción sin iniciar Gemini, Fish Audio, Groq ni Instagram. El Worker usa
-ese mismo criterio cuando `KNASTA_ENABLED=true`, selecciona la mejor oferta y
-envía su ficha JSON a Cloud Run. Cloud Run conserva además un endpoint `/offers`
-para entornos donde Knasta permita la consulta desde esa red.
-
 ## Fuentes
 
-- [Google Cloud: generación de imágenes con Gemini 3.1 Flash Image](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/image-generation)
-- [Google Cloud: Gemini 3 Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-flash)
+- [OpenAI: edición y referencias con GPT Image 2](https://developers.openai.com/api/docs/guides/image-generation#edit-images)
 - [Google Cloud: Gemini Omni Flash en Agent Platform](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/omni-flash-preview?hl=es)
-- [Google Cloud: video con imágenes de referencia y Gemini Omni Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/use-reference-images-to-guide-video-generation)
+- [Google Cloud: generación de video con Gemini Omni Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/generate-videos-from-text)
 - [Fish Audio: Text to Speech](https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech)
 - [Groq: Speech to Text](https://console.groq.com/docs/speech-to-text)
 - [MoviePy: documentación](https://zulko.github.io/moviepy/)
