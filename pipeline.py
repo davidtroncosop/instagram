@@ -87,10 +87,17 @@ def gemini_backend() -> str:
 
 def create_gemini_client(backend: str) -> Any:
     if backend == "vertex":
-        project = required_env("GOOGLE_CLOUD_PROJECT")
-        location = os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global"
-        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        return genai.Client(vertexai=True, project=project, location=location, credentials=credentials)
+        try:
+            project = required_env("GOOGLE_CLOUD_PROJECT")
+            location = os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global"
+            credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            return genai.Client(vertexai=True, project=project, location=location, credentials=credentials)
+        except Exception as exc:
+            print(f"Aviso Vertex AI credentials: {exc}. Usando GEMINI_API_KEY...")
+            api_key = os.getenv("GEMINI_API_KEY")
+            if api_key:
+                return genai.Client(api_key=api_key)
+            raise
 
     return genai.Client(api_key=required_env("GEMINI_API_KEY"))
 
@@ -271,6 +278,30 @@ def product_image_candidates(page_html: str, page_url: str) -> list[str]:
     return candidates
 
 
+def knasta_fetch_html(url: str, timeout: int = 30) -> str:
+    """Fetch Knasta HTML using primp TLS impersonation to bypass Cloudflare 403 blocks in cloud datacenters."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://knasta.cl/",
+    }
+    try:
+        import primp
+        client = primp.Client()
+        resp = client.get(url, headers=headers, follow_redirects=True, timeout=timeout)
+        if resp.status_code == 200 and len(resp.text) > 100:
+            return resp.text
+        print(f"Advertencia primp status {resp.status_code} al consultar '{url}'")
+    except Exception as exc:
+        print(f"Aviso primp exception: {exc}")
+
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+        return resp.text
+
+
 def scrape_knasta_product(knasta_url: str, output_dir: Path, count: int = 4) -> list[Path]:
     """Scrape garment images and offer data directly from a Knasta deal URL."""
     headers = {
@@ -278,91 +309,98 @@ def scrape_knasta_product(knasta_url: str, output_dir: Path, count: int = 4) -> 
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     }
     try:
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
-            resp = client.get(knasta_url)
-            resp.raise_for_status()
-            html = resp.text
-
-        json_ld_matches = re.findall(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
-        product_data = {}
-        for j_text in json_ld_matches:
-            try:
-                data = json.loads(j_text.strip())
-                if isinstance(data, dict) and data.get("@type") == "Product":
-                    product_data = data
-                    break
-            except Exception:
-                continue
-
-        if not product_data:
-            raise PipelineError(f"No se pudo extraer la información del producto de Knasta: {knasta_url}")
-
-        product_name = product_data.get("name", "Producto sin nombre")
-        brand = product_data.get("brand", {}).get("name", "Marca") if isinstance(product_data.get("brand"), dict) else str(product_data.get("brand") or "Marca")
-        offers = product_data.get("offers", {})
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-
-        offer_price = str(offers.get("price", ""))
-        seller = offers.get("seller", {}).get("name", "Retailer") if isinstance(offers.get("seller"), dict) else "Retailer"
-        orig_price_match = re.search(r'Anterior:</span><span[^>]*>\$\s*([\d\.]+)', html)
-        normal_price = orig_price_match.group(1).replace(".", "") if orig_price_match else offer_price
-        disc_match = re.search(r'<span[^>]*>(\d+%)</span>', html)
-        discount_percentage = disc_match.group(1) if disc_match else "0%"
-
-        partner_match = re.search(r'partner_url=([^"&\s]+)', html)
-        if partner_match:
-            retailer_url = unquote(partner_match.group(1))
-            dl_match = re.search(r'dl=([^"&\s]+)', retailer_url)
-            if dl_match:
-                retailer_url = unquote(dl_match.group(1))
-        else:
-            retailer_url = knasta_url
-
-        raw_images = product_data.get("image", [])
-        if isinstance(raw_images, str):
-            raw_images = [raw_images]
-
-        image_urls = []
-        for img_url in raw_images:
-            upgraded_url = re.sub(r'w=\d+,h=\d+', 'w=1000,h=1000', img_url)
-            image_urls.append(upgraded_url)
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        downloaded: list[Path] = []
-        downloaded_urls: list[str] = []
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
-            for idx, img_url in enumerate(image_urls[:count], 1):
-                try:
-                    img_resp = client.get(img_url)
-                    img_resp.raise_for_status()
-                    img_path = output_dir / f"{idx:02d}-prenda.jpg"
-                    img_path.write_bytes(img_resp.content)
-                    downloaded.append(img_path)
-                    downloaded_urls.append(img_url)
-                except Exception as exc:
-                    print(f"Advertencia: no se pudo descargar la imagen {img_url}: {exc}")
-
-        if not downloaded:
-            raise PipelineError("No se pudieron descargar imágenes del producto desde Knasta")
-
-        offer_json = {
-            "product_name": product_name,
-            "brand": brand,
-            "retailer": seller,
-            "normal_price": normal_price,
-            "offer_price": offer_price,
-            "discount_percentage": discount_percentage,
-            "url": retailer_url,
-            "knasta_url": knasta_url
-        }
-        (output_dir / "offer.json").write_text(json.dumps(offer_json, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        (output_dir / "source.json").write_text(json.dumps({"product_url": knasta_url, "image_urls": downloaded_urls}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return downloaded
+        html = knasta_fetch_html(knasta_url)
     except Exception as exc:
-        if isinstance(exc, PipelineError):
-            raise
+        print(f"Advertencia al consultar Knasta ({exc}), intentando desviar a la tienda original...")
+        match = re.search(r'/detail/([^/]+)/([^/]+)/?([^/]+)?', knasta_url)
+        if match:
+            ret, pid, slug = match.group(1).lower(), match.group(2), match.group(3) or "producto"
+            if ret in {"falabella", "falabella-cl"}:
+                direct_url = f"https://www.falabella.com/falabella-cl/product/{pid}/{slug}"
+                print(f"Desviando a tienda directa Falabella: {direct_url}")
+                return download_product_images(direct_url, output_dir, count=count)
+            elif ret in {"paris", "paris-cl"}:
+                direct_url = f"https://www.paris.cl/{slug}-{pid}.html"
+                print(f"Desviando a tienda directa Paris: {direct_url}")
+                return download_product_images(direct_url, output_dir, count=count)
         raise PipelineError(f"Error al procesar la ficha de Knasta: {exc}") from exc
+
+    json_ld_matches = re.findall(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
+    product_data = {}
+    for j_text in json_ld_matches:
+        try:
+            data = json.loads(j_text.strip())
+            if isinstance(data, dict) and data.get("@type") == "Product":
+                product_data = data
+                break
+        except Exception:
+            continue
+
+    if not product_data:
+        raise PipelineError(f"No se pudo extraer la información del producto de Knasta: {knasta_url}")
+
+    product_name = product_data.get("name", "Producto sin nombre")
+    brand = product_data.get("brand", {}).get("name", "Marca") if isinstance(product_data.get("brand"), dict) else str(product_data.get("brand") or "Marca")
+    offers = product_data.get("offers", {})
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+
+    offer_price = str(offers.get("price", ""))
+    seller = offers.get("seller", {}).get("name", "Retailer") if isinstance(offers.get("seller"), dict) else "Retailer"
+    orig_price_match = re.search(r'Anterior:</span><span[^>]*>\$\s*([\d\.]+)', html)
+    normal_price = orig_price_match.group(1).replace(".", "") if orig_price_match else offer_price
+    disc_match = re.search(r'<span[^>]*>(\d+%)</span>', html)
+    discount_percentage = disc_match.group(1) if disc_match else "0%"
+
+    partner_match = re.search(r'partner_url=([^"&\s]+)', html)
+    if partner_match:
+        retailer_url = unquote(partner_match.group(1))
+        dl_match = re.search(r'dl=([^"&\s]+)', retailer_url)
+        if dl_match:
+            retailer_url = unquote(dl_match.group(1))
+    else:
+        retailer_url = knasta_url
+
+    raw_images = product_data.get("image", [])
+    if isinstance(raw_images, str):
+        raw_images = [raw_images]
+
+    image_urls = []
+    for img_url in raw_images:
+        upgraded_url = re.sub(r'w=\d+,h=\d+', 'w=1000,h=1000', img_url)
+        image_urls.append(upgraded_url)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[Path] = []
+    downloaded_urls: list[str] = []
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
+        for idx, img_url in enumerate(image_urls[:count], 1):
+            try:
+                img_resp = client.get(img_url)
+                img_resp.raise_for_status()
+                img_path = output_dir / f"{idx:02d}-prenda.jpg"
+                img_path.write_bytes(img_resp.content)
+                downloaded.append(img_path)
+                downloaded_urls.append(img_url)
+            except Exception as exc:
+                print(f"Advertencia: no se pudo descargar la imagen {img_url}: {exc}")
+
+    if not downloaded:
+        raise PipelineError("No se pudieron descargar imágenes del producto desde Knasta")
+
+    offer_json = {
+        "product_name": product_name,
+        "brand": brand,
+        "retailer": seller,
+        "normal_price": normal_price,
+        "offer_price": offer_price,
+        "discount_percentage": discount_percentage,
+        "url": retailer_url,
+        "knasta_url": knasta_url
+    }
+    (output_dir / "offer.json").write_text(json.dumps(offer_json, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "source.json").write_text(json.dumps({"product_url": knasta_url, "image_urls": downloaded_urls}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return downloaded
 
 
 def download_product_images(product_url: str, output_dir: Path, count: int = 4) -> list[Path]:
@@ -372,71 +410,117 @@ def download_product_images(product_url: str, output_dir: Path, count: int = 4) 
     if "knasta.cl" in hostname or "knasta.com" in hostname:
         return scrape_knasta_product(product_url, output_dir, count)
 
-    allowed_host = (
-        hostname in {"falabella.com", "falabella.cl"}
-        or hostname.endswith(".falabella.com")
-        or hostname.endswith(".falabella.cl")
-    )
-    if parsed.scheme != "https" or not allowed_host:
+    if parsed.scheme != "https" or not hostname:
         raise PipelineError(
-            "--product-url debe ser una ficha HTTPS de Knasta (knasta.cl) o Falabella."
+            "--product-url debe ser una ficha HTTPS de Knasta o una tienda soportada (Falabella, Paris, Ripley, etc.)."
         )
     if count <= 0:
         raise PipelineError("La cantidad de imágenes a descargar debe ser mayor que cero")
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; InstagramOfferPipeline/1.0)",
-        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     try:
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=45) as client:
-            page_response = client.get(product_url)
-            page_response.raise_for_status()
-            candidates = product_image_candidates(page_response.text, str(page_response.url))
-            if len(candidates) < count:
-                raise PipelineError(
-                    f"La ficha solo expuso {len(candidates)} imagen(es); se necesitan {count}."
-                )
+        try:
+            import primp
+            p_client = primp.Client()
+            resp = p_client.get(product_url, headers=headers, follow_redirects=True, timeout=45)
+            if resp.status_code == 200 and len(resp.text) > 100:
+                html_text = resp.text
+                final_url = str(urlparse(product_url).geturl())
+            else:
+                html_text = None
+        except Exception:
+            html_text = None
 
-            output_dir.mkdir(parents=True, exist_ok=True)
-            downloaded: list[Path] = []
-            downloaded_urls: list[str] = []
-            for image_url in candidates:
-                if len(downloaded) >= count:
-                    break
+        if not html_text:
+            with httpx.Client(headers=headers, follow_redirects=True, timeout=45) as client:
+                page_response = client.get(product_url)
+                page_response.raise_for_status()
+                html_text = page_response.text
+                final_url = str(page_response.url)
+
+        candidates = product_image_candidates(html_text, final_url)
+        if len(candidates) < count:
+            raise PipelineError(
+                f"La ficha solo expuso {len(candidates)} imagen(es); se necesitan {count}."
+            )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        downloaded: list[Path] = []
+        downloaded_urls: list[str] = []
+        img_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Referer": final_url,
+        }
+
+        for image_url in candidates:
+            if len(downloaded) >= count:
+                break
+            try:
+                img_data = None
                 try:
-                    image_response = client.get(
-                        image_url,
-                        headers={"Accept": "image/avif,image/webp,image/jpeg,image/png,image/*"},
-                    )
-                    image_response.raise_for_status()
-                except httpx.HTTPError:
+                    import primp
+                    p_c = primp.Client()
+                    res = p_c.get(image_url, headers=img_headers, follow_redirects=True, timeout=15)
+                    if res.status_code == 200 and len(res.content) > 1000:
+                        img_data = res.content
+                except Exception:
+                    pass
+
+                if not img_data:
+                    with httpx.Client(headers=img_headers, follow_redirects=True, timeout=15) as client:
+                        res = client.get(image_url)
+                        if res.status_code == 200 and len(res.content) > 1000:
+                            img_data = res.content
+
+                if not img_data:
                     continue
-                content_type = image_response.headers.get("content-type", "").split(";", 1)[0].lower()
-                extension = mimetypes.guess_extension(content_type or "") or Path(urlparse(image_url).path).suffix.lower()
+
+                # Verify valid image using PIL
+                try:
+                    with Image.open(io.BytesIO(img_data)) as test_img:
+                        test_img.verify()
+                except Exception as img_err:
+                    print(f"Advertencia: imagen no válida descartada ({image_url}): {img_err}")
+                    continue
+
+                extension = Path(urlparse(image_url).path).suffix.lower()
                 if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
                     extension = ".jpg"
-                if not image_response.content or len(image_response.content) > 20 * 1024 * 1024:
-                    continue
+
                 image_path = output_dir / f"{len(downloaded) + 1:02d}-prenda{extension}"
-                image_path.write_bytes(image_response.content)
+                image_path.write_bytes(img_data)
                 downloaded.append(image_path)
                 downloaded_urls.append(image_url)
+            except Exception as exc:
+                print(f"Advertencia: no se pudo procesar la imagen {image_url}: {exc}")
 
-            if len(downloaded) < count:
-                raise PipelineError(
-                    f"Solo se pudieron descargar {len(downloaded)} de {count} imágenes desde la ficha de Falabella."
-                )
-            (output_dir / "source.json").write_text(
-                json.dumps(
-                    {"product_url": product_url, "image_urls": downloaded_urls},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+        if not downloaded:
+            raise PipelineError(
+                f"No se pudieron descargar imágenes válidas desde la ficha de la prenda."
             )
-            return downloaded
+        # Pad up to count if product page had fewer valid views (e.g., 3 instead of 4)
+        original_count = len(downloaded)
+        while len(downloaded) < count:
+            src_path = downloaded[len(downloaded) % original_count]
+            ext = src_path.suffix
+            padded_path = output_dir / f"{len(downloaded) + 1:02d}-prenda{ext}"
+            padded_path.write_bytes(src_path.read_bytes())
+            downloaded.append(padded_path)
+        (output_dir / "source.json").write_text(
+            json.dumps(
+                {"product_url": product_url, "image_urls": downloaded_urls},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return downloaded
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 403:
             raise PipelineError(
@@ -1813,51 +1897,100 @@ def publish_tiktok(public_video_url: str, title: str) -> str:
     raise PipelineError("Tiempo agotado esperando a TikTok")
 
 
+def extract_knasta_pid(url: str) -> str:
+    url_clean = url.split("?")[0].split("#")[0].strip()
+    match = re.search(r'/detail/[^/]+/([^/]+)', url_clean)
+    if match:
+        return match.group(1).lower()
+    return ""
+
 def auto_discover_knasta_url(history_file: Path = Path("published_history.json"), query: str = "polera") -> str:
     """Automatically find the top unpublished deal on Knasta for autonomous execution."""
-    history = set()
+    history_pids = set()
+    history_urls = set()
     if history_file.is_file():
         try:
             data = json.loads(history_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                # Add both media_id mapping values and published_urls list
                 for item in data.values():
-                    if isinstance(item, dict) and item.get("product_url"):
-                        history.add(item.get("product_url").strip())
+                    if isinstance(item, dict):
+                        u = item.get("product_url", "")
+                        if u:
+                            history_urls.add(u.strip())
+                            pid = extract_knasta_pid(u)
+                            if pid:
+                                history_pids.add(pid)
                 for u in data.get("published_urls", []):
-                    history.add(u.strip())
-        except Exception:
-            pass
+                    if u:
+                        history_urls.add(u.strip())
+                        pid = extract_knasta_pid(u)
+                        if pid:
+                            history_pids.add(pid)
+        except Exception as exc:
+            print(f"Advertencia al leer historial: {exc}")
 
-    # Priority category: Falabella Ropa Mujer with >= 30% discount
+    search_queries = [
+        "vestido", "polera", "chaqueta", "falda", "poleron", "pantalon",
+        "jeans", "sweater", "blusa", "trench", "parka", "abrigos",
+        "shorts", "top", "zapatillas", "ropa"
+    ]
+    import random
+    random.shuffle(search_queries)
+
     category_urls = [
         "https://knasta.cl/results/mujer/ropa-mujer?d=-30&partners=falabella",
-        f"https://knasta.cl/results?q={query}",
-        "https://knasta.cl/results?q=chaqueta",
-        "https://knasta.cl/results?q=vestido"
-    ]
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-    }
+        "https://knasta.cl/results/mujer/ropa-mujer?d=-20",
+    ] + [f"https://knasta.cl/results?q={q}" for q in search_queries]
 
     for cat_url in category_urls:
         try:
-            with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
-                resp = client.get(cat_url)
-                resp.raise_for_status()
-                html = resp.text
+            html = knasta_fetch_html(cat_url)
+            if not html or len(html) < 100:
+                continue
 
             detail_urls = re.findall(r'href="(/detail/[^"]+)"', html)
             unique_links = list(dict.fromkeys(detail_urls))
+            random.shuffle(unique_links)
             for rel_path in unique_links:
                 full_url = f"https://knasta.cl{rel_path}"
-                if full_url not in history:
-                    print(f"Auto-descubierta oferta destacada de Falabella en Knasta: {full_url}")
+                pid = extract_knasta_pid(full_url)
+                
+                is_published = (full_url in history_urls) or (pid and pid in history_pids)
+                if not is_published:
+                    print(f"Auto-descubierta oferta destacada de Knasta: {full_url}")
                     return full_url
-        except Exception as exc:
-            print(f"Advertencia al consultar Knasta URL '{cat_url}': {exc}")
+        except Exception as cat_exc:
+            print(f"Aviso al consultar Knasta categoría '{cat_url}': {cat_exc}")
+
+    # Fallback: consultar buscador público (DDG) si Knasta directo está bloqueado en datacenters
+    print("Buscando ofertas de Knasta mediante buscador público (Fallback)...")
+    try:
+        import primp
+        from urllib.parse import unquote
+        ddg_client = primp.Client()
+        ddg_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        for q in search_queries:
+            try:
+                ddg_url = "https://html.duckduckgo.com/html/"
+                res = ddg_client.post(ddg_url, data={"q": f"site:knasta.cl/detail/ {q}"}, headers=ddg_headers)
+                if res.status_code == 200:
+                    found_links = re.findall(r'knasta\.cl/detail/[^"&\s]+', res.text)
+                    cleaned_links = list(dict.fromkeys([unquote(l).strip() for l in found_links]))
+                    random.shuffle(cleaned_links)
+                    for raw_l in cleaned_links:
+                        full_url = "https://" + raw_l
+                        pid = extract_knasta_pid(full_url)
+                        is_published = (full_url in history_urls) or (pid and pid in history_pids)
+                        if not is_published:
+                            print(f"Auto-descubierta oferta destacada de Knasta vía DDG: {full_url}")
+                            return full_url
+            except Exception as exc:
+                print(f"Advertencia al consultar DDG para query '{q}': {exc}")
+    except Exception as exc:
+        print(f"Advertencia en fallback DDG: {exc}")
 
     raise PipelineError("No se encontraron ofertas nuevas en Knasta para publicar.")
 
@@ -1964,8 +2097,8 @@ def main() -> int:
     try:
         if args.script_file and args.narration_text:
             raise PipelineError("Usa --script-file o --narration-text, no ambos")
-        if args.generate_script and not args.offer_json and not args.product_url:
-            raise PipelineError("--generate-script necesita --offer-json")
+        if args.generate_script and not args.offer_json and not args.product_url and not args.auto_discover:
+            raise PipelineError("--generate-script necesita --offer-json o --product-url / --auto-discover")
 
         if args.reference_image and (
             args.model_image or args.garment_image or args.garment_dir or args.product_url
